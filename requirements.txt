@@ -1,0 +1,10 @@
+paramiko
+asyncssh
+python-dotenv
+rich
+uvicorn
+fastapi
+pydantic
+ollama
+loguru
+pyyaml
