@@ -1,0 +1,75 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HoneySSH  +  Ollama  —  full stack
+#
+# Quick start:
+#   docker compose up --build
+#
+# The ollama service starts first.  The honeyssh entrypoint waits until
+# Ollama is reachable before starting the honeypot, so the model pull
+# and server start are fully automatic.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Ollama LLM backend ───────────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: honeyssh_ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama   # model files persist across restarts
+    ports:
+      - "11434:11434"               # expose so you can run `ollama ls` locally
+    networks:
+      - honeypot
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:11434/v1/models"]
+      interval: 10s
+      timeout: 5s
+      retries: 12            # up to 2 minutes for first-start key generation
+      start_period: 10s
+
+    # ── GPU support ──────────────────────────────────────────────────────
+    # Uncomment the block below if you have an NVIDIA GPU + nvidia-container-toolkit
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+
+  # ── HoneySSH honeypot ────────────────────────────────────────────────────
+  honeyssh:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: honeyssh
+    restart: unless-stopped
+    env_file: .env               # picks up OLLAMA_URL, OLLAMA_MODEL, etc.
+    environment:
+      - OLLAMA_URL=http://ollama:11434   # override: use docker service name
+    ports:
+      - "2222:2222"              # SSH honeypot  (map 22→2222 in prod)
+      - "2223:2223"              # Telnet honeypot
+    volumes:
+      - ./logs:/app/var/log/cowrie              # session logs
+      - ./downloads:/app/var/lib/cowrie/downloads  # attacker file drops
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - honeypot
+
+
+# ── Shared network (honeyssh talks to ollama by service name) ─────────────
+networks:
+  honeypot:
+    driver: bridge
+
+# ── Named volume for Ollama model cache ───────────────────────────────────
+volumes:
+  ollama_data:

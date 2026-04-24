@@ -1,3 +1,10 @@
+# ── HoneySSH specific ─────────────────────────────────────────────────────
+# SSH host keys — generated at build/runtime, never commit
+etc/ssh_host_*
+# Attacker session data
+logs/
+downloads/
+var/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
