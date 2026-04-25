@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import os
+import struct
 import time
 from typing import Optional
 
 from twisted.conch.ssh import connection
+from twisted.internet import reactor
+from twisted.internet.threads import deferToThread
 from twisted.python import log
 
 from cowrie.core import ttylog
 from cowrie.core.config import CowrieConfig
 from cowrie.ssh_proxy.protocols import base_protocol
-from cowrie.ssh_proxy.util import int_to_hex, string_to_hex
 
 # Import LLM client for command analysis
 from LLM.client import OllamaClient
@@ -73,10 +75,20 @@ class Term(base_protocol.BaseProtocol):
             ttylog.ttylog_open(self.ttylogFile, self.startTime)
 
         initialize_session_state(self.session_id, {})
-        initialize_llm_session(
-            self.session_id,
-            username=self.username or "root",
+        # Map every attacker to an unprivileged shell regardless of what
+        # username they authenticated with.  Root logins are redirected to
+        # the 'ubuntu' account; this forces privilege escalation attempts
+        # and generates more realistic attacker behaviour data.
+        shell_user = (
+            "ubuntu"
+            if not self.username or self.username.lower() in ("root", "admin", "administrator")
+            else self.username
         )
+        initialize_llm_session(self.session_id, username=shell_user)
+
+        # Send the initial shell prompt on the next reactor tick (after
+        # MSG_CHANNEL_SUCCESS has been flushed to the attacker).
+        reactor.callLater(0.05, self._send_initial_prompt)
 
     def set_terminal_environment(
         self, term_type: str, columns: int = 80, rows: int = 24, env_vars: Optional[dict] = None
@@ -167,13 +179,8 @@ class Term(base_protocol.BaseProtocol):
                             + self.command[self.pointer :]
                         )
                         self.pointer -= 1
-                    # TODO: Log backspace keystroke event to Ollama
-                    # self.ollama_client.process_keystroke_event(
-                    #     session_id=self.transportId,
-                    #     keystroke_type='backspace',
-                    #     command_so_far=self.command.decode('utf-8', errors='replace'),
-                    #     username=self.username,
-                    # )
+                        # Erase character on screen: BS SPACE BS
+                        self._send_terminal_response(b"\x08 \x08")
                     self.data = self.data[1:]
                     update_session_buffer(self.session_id, self.command)
                 # If enter or ctrl+c or newline
@@ -186,6 +193,7 @@ class Term(base_protocol.BaseProtocol):
                         self.command += b"^C"
 
                     self.data = self.data[1:]
+                    self._send_terminal_response(b"\r\n")
 
                     try:
                         if self.command != b"":
@@ -194,15 +202,19 @@ class Term(base_protocol.BaseProtocol):
                                 input=self.command.decode("utf8"),
                                 format="CMD: %(input)s",
                             )
-
-                            result = process_command(
+                            # Run the blocking LLM call in a thread so the
+                            # Twisted reactor stays free to handle other events.
+                            captured = self.command
+                            d = deferToThread(
+                                process_command,
                                 session_id=self.session_id,
-                                command=self.command,
+                                command=captured,
                                 protocol="ssh",
                             )
-                            terminal_response = result.get("terminal_response", b"")
-                            if terminal_response:
-                                self._send_terminal_response(terminal_response)
+                            d.addCallback(self._on_command_result)
+                            d.addErrback(self._on_command_error)
+                        else:
+                            self._send_prompt()
                     except UnicodeDecodeError:
                         log.err(f"Unusual execcmd: {self.command!r}")
 
@@ -239,12 +251,14 @@ class Term(base_protocol.BaseProtocol):
                     self.data = self.data[3:]
                     update_session_buffer(self.session_id, self.command)
                 else:
+                    char = self.data[:1]
                     self.command = (
                         self.command[: self.pointer]
-                        + self.data[:1]
+                        + char
                         + self.command[self.pointer :]
                     )
                     self.pointer += 1
+                    self._send_terminal_response(char)  # local echo
                     self.data = self.data[1:]
                     update_session_buffer(self.session_id, self.command)
 
@@ -310,10 +324,76 @@ class Term(base_protocol.BaseProtocol):
                     data,
                 )
 
+    def _on_command_result(self, result: dict) -> None:
+        """Callback: LLM responded — send output then prompt."""
+        try:
+            terminal_response = result.get("terminal_response", b"")
+            if terminal_response:
+                self._send_terminal_response(terminal_response)
+            self._send_prompt()
+        except Exception as exc:
+            log.err(f"Error in command result handler (session {self.session_id}): {exc}")
+            try:
+                self._send_prompt()
+            except Exception:
+                pass
+
+    def _on_command_error(self, failure) -> None:
+        """Errback: LLM call failed — still show prompt so the session stays alive."""
+        log.err(f"LLM command error (session {self.session_id}): {failure.getErrorMessage()}")
+        try:
+            self._send_prompt()
+        except Exception:
+            pass
+
     def _send_terminal_response(self, response: bytes) -> None:
         """Inject the shell bridge response into the attacker's terminal."""
         try:
-            payload = int_to_hex(self.channelId) + string_to_hex(response)
+            if isinstance(response, str):
+                response = response.encode("utf-8", errors="replace")
+            # MSG_CHANNEL_DATA: uint32 recipient_channel, string data
+            payload = (
+                struct.pack(">I", self.channelId)
+                + struct.pack(">I", len(response))
+                + response
+            )
             self.ssh.send_back("[SERVER]", connection.MSG_CHANNEL_DATA, payload)
+            # Replenish the client's send window so it can keep typing
+            adjust = struct.pack(">I", self.channelId) + struct.pack(">I", len(response) + 4096)
+            self.ssh.send_back("[SERVER]", connection.MSG_CHANNEL_WINDOW_ADJUST, adjust)
         except Exception as e:
             log.err(f"Error sending terminal response for session {self.session_id}: {e}")
+
+    def _send_prompt(self) -> None:
+        """Send a bash-style shell prompt reflecting the current working directory."""
+        try:
+            from server.protocols.shell import get_shell_bridge
+            state = get_shell_bridge().state_tracker.get_state(self.session_id)
+            cwd = state.get("cwd", "/home/ubuntu") if state else "/home/ubuntu"
+        except Exception:
+            cwd = "/home/ubuntu"
+
+        # Use the LLM session username (the mapped shell user, not the SSH auth user)
+        from server.protocols.shell import get_shell_bridge
+        meta = get_shell_bridge().ollama_client._session_meta.get(self.session_id, {})
+        username = meta.get("username", "ubuntu")
+        hostname = meta.get("hostname", "ubuntu-srv")
+        home = "/root" if username == "root" else f"/home/{username}"
+        display_cwd = "~" if cwd == home else cwd
+        char = "#" if username == "root" else "$"
+        prompt = f"{username}@{hostname}:{display_cwd}{char} "
+        self._send_terminal_response(prompt.encode())
+
+    def _send_initial_prompt(self) -> None:
+        """Send MOTD and the first shell prompt when the session opens."""
+        try:
+            motd = (
+                b"\r\nWelcome to Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-91-generic x86_64)\r\n"
+                b"\r\n"
+                b" * Documentation:  https://help.ubuntu.com\r\n"
+                b"\r\n"
+            )
+            self._send_terminal_response(motd)
+            self._send_prompt()
+        except Exception as e:
+            log.err(f"Error sending initial prompt for session {self.session_id}: {e}")

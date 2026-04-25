@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 import json
 import os
+import posixpath  # always POSIX paths for the simulated Linux filesystem
 from typing import Optional, Dict, Any
 from twisted.python import log
 
@@ -58,7 +59,7 @@ class SessionStateTracker:
             Initial state dictionary
         """
         state = {
-            'cwd': '/home/user',  # Default starting directory
+            'cwd': '/home/ubuntu',  # Default — overridden per-session by initialize_llm_session
             'env': env_vars or {},
             'buffer': '',
             'previous_cwd': None,  # For 'cd -' support
@@ -148,11 +149,11 @@ class SessionStateTracker:
         """
         # If path is absolute, use it directly
         if path.startswith('/'):
-            return os.path.normpath(path)
-        
+            return posixpath.normpath(path)
+
         # If path is relative, resolve from cwd
-        resolved = os.path.join(cwd, path)
-        normalized = os.path.normpath(resolved)
+        resolved = posixpath.join(cwd, path)
+        normalized = posixpath.normpath(resolved)
         
         return normalized
     
@@ -181,24 +182,20 @@ class SessionStateTracker:
         # Handle 'cd' command
         if cmd == 'cd':
             old_cwd = state['cwd']
-            
+            home = state.get('home_dir', '/home/ubuntu')
+
             if len(tokens) == 1:
-                # Just 'cd' means go home
                 state['previous_cwd'] = old_cwd
-                state['cwd'] = '/home/user'
+                state['cwd'] = home
             elif tokens[1] == '-':
-                # 'cd -' means go to previous directory
                 if state['previous_cwd']:
                     target = state['previous_cwd']
                     state['previous_cwd'] = old_cwd
                     state['cwd'] = target
-                # else: no previous directory, stay put
-            elif tokens[1] == '~':
-                # 'cd ~' means home directory
+            elif tokens[1] in ('~', f'~{state.get("home_dir", "")}'.rstrip('/')):
                 state['previous_cwd'] = old_cwd
-                state['cwd'] = '/home/user'
+                state['cwd'] = home
             else:
-                # Regular path
                 target_path = tokens[1]
                 new_cwd = self._resolve_path(old_cwd, target_path)
                 state['previous_cwd'] = old_cwd
@@ -392,16 +389,18 @@ class ShellCommandBridge:
     def initialize_llm_session(
         self,
         session_id: str,
-        username: str = "root",
+        username: str = "ubuntu",
         hostname: str = "ubuntu-srv",
     ) -> None:
         """
-        Seed the LLM with the attacker's identity for this session.
-
-        Call this once after authentication so every subsequent LLM call
-        receives a system prompt that names the correct user and home dir.
+        Seed the LLM with the attacker's identity and set the session cwd
+        to the correct home directory for that user.
         """
         self.ollama_client.initialize_session(session_id, username, hostname)
+        home = "/root" if username == "root" else f"/home/{username}"
+        state = self.state_tracker.ensure_state(session_id)
+        state["cwd"] = home
+        state["home_dir"] = home
 
     def process_shell_command(
         self,
@@ -449,9 +448,6 @@ class ShellCommandBridge:
             log.msg(f"Duplicate command detected for session {session_id}")
             return {"duplicate": True}
         
-        # Update cwd if this is a cd command
-        self.state_tracker.update_cwd_from_command(session_id, cleaned_command)
-        
         # Record command in state history
         self.state_tracker.record_command(session_id, cleaned_command)
         
@@ -488,6 +484,12 @@ class ShellCommandBridge:
             command=cleaned_command,
             execution_payload=execution_payload,
         )
+
+        # Only update cwd after the LLM confirms cd succeeded (no output = success in bash)
+        first_token = cleaned_command.split()[0].lower() if cleaned_command.split() else ""
+        if first_token == "cd" and not llm_response_text.strip():
+            self.state_tracker.update_cwd_from_command(session_id, cleaned_command)
+
         terminal_response = self.format_response_for_terminal(
             {
                 'error': execution_payload.get('error'),

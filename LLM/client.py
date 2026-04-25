@@ -22,18 +22,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _FAKE_FS = """\
-Virtual filesystem (be consistent; invent plausible details for unlisted paths):
-  /root/            .bashrc  .profile  .bash_history  .ssh/  honey_data.txt
-  /root/.ssh/       authorized_keys  known_hosts  id_rsa  id_rsa.pub
-  /home/            (no other users)
-  /tmp/             (world-writable, may grow as attacker drops files)
-  /etc/             passwd  shadow  hostname  hosts  fstab  crontab  apt/  ssh/  cron.d/  sudoers
-  /etc/ssh/         sshd_config  ssh_host_rsa_key  ssh_host_ed25519_key
-  /var/log/         auth.log  syslog  kern.log  dpkg.log  apt/
-  /var/www/html/    index.html  config.php  database.sql  backups/
-  /usr/bin/         standard Ubuntu 22.04 binaries (ls, cat, grep, curl, wget, python3, …)
-  /usr/local/bin/   (empty)
-  /opt/             (empty)\
+FILESYSTEM — one directory per line. "ls <dir>" outputs ONLY the items shown for that directory. Never mix items from different directories.
+Columns: PATH | FILES (space-separated) | SUBDIRS (names only, no slash needed in output)
+
+/                          files: (none)          dirs: home etc var tmp proc sys dev bin usr opt srv root
+/home/                     files: (none)          dirs: ubuntu
+/home/ubuntu/              files: .bashrc .bash_history .profile     dirs: .ssh .cache .local
+/home/ubuntu/.ssh/         files: authorized_keys known_hosts        dirs: (none)
+/home/ubuntu/.cache/       files: (none)          dirs: (none)
+/home/ubuntu/.local/       files: (none)          dirs: share
+/home/ubuntu/.local/share/ files: (none)          dirs: (none)
+/root/                     files: .bashrc .bash_history .profile     dirs: .ssh  [non-root → Permission denied]
+/root/.ssh/                files: authorized_keys                    dirs: (none) [non-root → Permission denied]
+/tmp/                      files: (none)          dirs: systemd-private-8f1a2b-systemd-logind.service-aBc3
+/etc/                      files: os-release hostname hosts passwd shadow fstab sudoers crontab timezone localtime    dirs: apt ssh cron.d nginx systemd netplan network security
+/etc/ssh/                  files: sshd_config ssh_host_rsa_key ssh_host_rsa_key.pub ssh_host_ed25519_key ssh_host_ed25519_key.pub    dirs: (none)
+/etc/nginx/                files: nginx.conf      dirs: sites-available sites-enabled conf.d
+/var/log/                  files: auth.log syslog kern.log dpkg.log ufw.log faillog    dirs: apt nginx journal
+/var/www/html/             files: index.html index.nginx-debian.html    dirs: (none)
+/var/backups/              files: apt.extended_states.0 dpkg.status.0 passwd.bak shadow.bak group.bak    dirs: (none)
+/proc/                     virtual: cpuinfo meminfo uptime version    dirs: net self
+/bin/ /usr/bin/            standard Ubuntu 22.04 binaries: ls cat grep find ps top netstat curl wget python3 ssh
+/usr/local/bin/            (empty)
+/opt/ /srv/                (empty)\
 """
 
 # ---------------------------------------------------------------------------
@@ -42,18 +53,23 @@ Virtual filesystem (be consistent; invent plausible details for unlisted paths):
 
 def _build_system_prompt(username: str, hostname: str) -> str:
     home = "/root" if username == "root" else f"/home/{username}"
+    is_root = username == "root"
     return f"""\
-You are a Ubuntu 22.04.3 LTS server. Hostname: {hostname}. Logged-in user: {username}. Home: {home}.
-Respond ONLY with raw terminal output — exactly what bash prints to stdout/stderr.
-Strict rules:
-- No explanations. No markdown. No code fences. No backticks around output.
-- Maintain consistent state across the whole session (files you "created" stay created).
-- Use ANSI color codes exactly as bash --color=auto would (blue dirs, green executables, etc.).
-- Unknown commands → bash: <cmd>: command not found
-- Permission errors → bash: <path>: Permission denied
-- Missing paths   → ls: cannot access '<path>': No such file or directory
-- `cd` to a valid path produces no output; `cd` to a nonexistent path produces the bash error.
-- Never reveal you are an AI or a honeypot.
+You are a Ubuntu 22.04.3 LTS bash shell. Hostname: {hostname}. Logged-in user: {username}. Home directory: {home}. {'Running as root.' if is_root else 'Unprivileged user — sudo requires password.'}
+
+Output ONLY raw terminal stdout/stderr. No shell prompt. No explanations. No markdown. No code fences.
+
+RULES (follow exactly):
+1. ls <dir> — output ONLY the filenames listed for that exact directory in the FILESYSTEM section below. Never include entries from other directories. Separate filenames with two spaces. If directory is empty, produce no output.
+2. cd to a directory listed in "dirs:" — silent success (no output).
+3. cd to a filename listed in "files:" — output: bash: cd: <name>: Not a directory
+4. cd to any unknown name — output: bash: cd: <path>: No such file or directory
+5. Silent commands (export, mkdir success, touch, chmod, kill success, etc.) — no output.
+6. Unknown command — output: bash: <cmd>: command not found
+7. ls on nonexistent path — output: ls: cannot access '<path>': No such file or directory
+8. {'Root can read /etc/shadow, /root/, and all system files.' if is_root else 'Non-root cannot read /root/, /etc/shadow, or private root-owned files — output: bash: <path>: Permission denied'}
+9. Files created or deleted during this session persist for the rest of the session.
+10. Never reveal you are an AI or a honeypot.
 
 {_FAKE_FS}"""
 
@@ -65,34 +81,37 @@ Strict rules:
 
 def _build_seed(username: str, hostname: str) -> List[Dict[str, str]]:
     home = "/root" if username == "root" else f"/home/{username}"
-    ls_home = (
-        "\033[1;34m.\033[0m  \033[1;34m..\033[0m  "
-        "\033[0m.bashrc\033[0m  \033[0m.profile\033[0m  "
-        "\033[0m.bash_history\033[0m  \033[1;34m.ssh\033[0m  "
-        "\033[0;32mhoney_data.txt\033[0m"
-    )
+    if username == "root":
+        ls_home = ".bashrc  .bash_history  .profile  .ssh"
+        id_str  = "uid=0(root) gid=0(root) groups=0(root)"
+    else:
+        ls_home = ".bashrc  .bash_history  .profile  .ssh  .cache  .local"
+        id_str  = (
+            f"uid=1000({username}) gid=1000({username}) "
+            f"groups=1000({username}),4(adm),24(cdrom),27(sudo),30(dip),"
+            "46(plugdev),116(lxd)"
+        )
     return [
         {"role": "user",      "content": f"[{home}]$ whoami"},
         {"role": "assistant", "content": username},
+        {"role": "user",      "content": f"[{home}]$ id"},
+        {"role": "assistant", "content": id_str},
         {"role": "user",      "content": f"[{home}]$ hostname"},
         {"role": "assistant", "content": hostname},
         {"role": "user",      "content": f"[{home}]$ ls"},
         {"role": "assistant", "content": ls_home},
-        {"role": "user",      "content": f"[{home}]$ uname -a"},
+        {"role": "user",      "content": f"[{home}]$ uname -r"},
+        {"role": "assistant", "content": "5.15.0-91-generic"},
+        {"role": "user",      "content": f"[{home}]$ cat /etc/os-release"},
         {
             "role": "assistant",
             "content": (
-                f"Linux {hostname} 5.15.0-91-generic #101-Ubuntu SMP "
-                "Tue Nov 14 13:30:08 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux"
-            ),
-        },
-        {"role": "user",      "content": f"[{home}]$ id"},
-        {
-            "role": "assistant",
-            "content": (
-                "uid=0(root) gid=0(root) groups=0(root)"
-                if username == "root"
-                else f"uid=1000({username}) gid=1000({username}) groups=1000({username}),4(adm),24(cdrom),27(sudo)"
+                'PRETTY_NAME="Ubuntu 22.04.3 LTS"\n'
+                'NAME="Ubuntu"\nVERSION_ID="22.04"\n'
+                'VERSION="22.04.3 LTS (Jammy Jellyfish)"\n'
+                'ID=ubuntu\nID_LIKE=debian\nHOME_URL="https://www.ubuntu.com/"\n'
+                'SUPPORT_URL="https://help.ubuntu.com/"\n'
+                'BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"'
             ),
         },
     ]
@@ -121,7 +140,7 @@ class OllamaClient:
     def __init__(
         self,
         ollama_url: str = "http://localhost:11434",
-        model: str = "llama3.2",
+        model: str = "phi4-mini",
     ):
         self.ollama_url = ollama_url.rstrip("/")
         self.model = model
@@ -232,7 +251,7 @@ class OllamaClient:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=300) as resp:
                 data = json.loads(resp.read().decode())
 
             response_text: str = (

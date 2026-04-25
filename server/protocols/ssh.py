@@ -12,8 +12,9 @@ from cowrie.ssh_proxy.protocols import (
     exec_term,
     port_forward,
     sftp,
-    term,
 )
+# Use our LLM-integrated Term, not Cowrie's proxy term
+from server.protocols import term
 from cowrie.ssh_proxy.util import int_to_hex, string_to_hex
 from server.protocols.shell import initialize_session_state, update_session_environment
 
@@ -184,6 +185,21 @@ class SSH(base_protocol.BaseProtocol):
 
                 self.create_channel(parent, channel_id, channel_type)
 
+                if self.client is None:
+                    # Standalone: no backend — confirm channel open directly to attacker
+                    self.sendOn = False
+                    # create_channel stored {"serverID": channel_id}, so
+                    # find it via "[CLIENT]" which searches by "serverID".
+                    channel = self.get_channel(channel_id, "[CLIENT]")
+                    channel["clientID"] = channel_id  # we are our own backend
+                    self.server.sendPacket(
+                        connection.MSG_CHANNEL_OPEN_CONFIRMATION,
+                        int_to_hex(channel_id)    # recipient (attacker's ID)
+                        + int_to_hex(channel_id)  # sender   (our ID)
+                        + int_to_hex(2097152)     # window   2 MB
+                        + int_to_hex(32768),      # max pkt  32 KB
+                    )
+
             elif channel_type == b"direct-tcpip" or channel_type == b"forwarded-tcpip":
                 self.extract_int(4)
                 self.extract_int(4)
@@ -266,6 +282,7 @@ class SSH(base_protocol.BaseProtocol):
             the_uuid = uuid.uuid4().hex
 
             if channel_type == b"shell":
+                want_reply = self.extract_bool()
                 channel["name"] = "[TERM" + str(channel["serverID"]) + "]"
                 channel["session"] = term.Term(
                     the_uuid, channel["name"], self, channel["clientID"]
@@ -278,6 +295,14 @@ class SSH(base_protocol.BaseProtocol):
                         env_vars=env_vars,
                     )
                 log.msg(f"MSG_CHANNEL_REQUEST: {channel_type!r}")
+
+                if self.client is None:
+                    self.sendOn = False
+                    if want_reply:
+                        self.server.sendPacket(
+                            connection.MSG_CHANNEL_SUCCESS,
+                            int_to_hex(channel["serverID"]),
+                        )
 
             elif channel_type == b"exec":
                 channel["name"] = "[EXEC" + str(channel["serverID"]) + "]"
@@ -328,7 +353,7 @@ class SSH(base_protocol.BaseProtocol):
                 dimensions, and other terminal-related options.
                 Format: string(term_type), uint32(width), uint32(height), uint32(pwidth), uint32(pheight)
                 """
-                _ = self.extract_bool()  # want_reply
+                want_reply = self.extract_bool()
                 term_type = self.extract_string()
                 columns = self.extract_int(4)
                 rows = self.extract_int(4)
@@ -350,8 +375,6 @@ class SSH(base_protocol.BaseProtocol):
                         env_vars = {}
                         if "env_vars" in channel:
                             env_vars.update(channel["env_vars"])
-                        # TODO: Extract environment variables if they're in the pty-req modes
-                        # For now, just pass basic terminal info
                         channel["session"].set_terminal_environment(
                             term_type=term_type.decode() if isinstance(term_type, bytes) else term_type,
                             columns=columns,
@@ -366,6 +389,14 @@ class SSH(base_protocol.BaseProtocol):
                         )
                     except Exception as e:
                         log.err(f"Error setting terminal environment: {e}")
+
+                if self.client is None:
+                    self.sendOn = False
+                    if want_reply:
+                        self.server.sendPacket(
+                            connection.MSG_CHANNEL_SUCCESS,
+                            int_to_hex(channel["serverID"]),
+                        )
 
             else:
                 # UNKNOWN CHANNEL REQUEST TYPE
@@ -382,28 +413,45 @@ class SSH(base_protocol.BaseProtocol):
         elif message_num == connection.MSG_CHANNEL_FAILURE:
             pass
 
+        elif message_num == connection.MSG_CHANNEL_WINDOW_ADJUST:
+            # Standalone: attacker is expanding our send window — nothing to forward
+            if self.client is None:
+                self.sendOn = False
+
         elif message_num == connection.MSG_CHANNEL_CLOSE:
             channel = self.get_channel(self.extract_int(4), parent)
-            # Is this needed?!
             channel[parent] = True
 
+            if self.client is None:
+                # Echo close back so the attacker's SSH client knows we closed too
+                self.sendOn = False
+                channel["[CLIENT]"] = True
+                try:
+                    self.server.sendPacket(
+                        connection.MSG_CHANNEL_CLOSE,
+                        int_to_hex(channel["serverID"]),
+                    )
+                except Exception:
+                    pass
+
             if "[SERVER]" in channel and "[CLIENT]" in channel:
-                # CHANNEL CLOSED
                 if channel["session"] is not None:
                     log.msg("remote close")
                     channel["session"].channel_closed()
-
                 self.channels.remove(channel)
+
         # - END Channels
         # - ChannelData
         elif message_num == connection.MSG_CHANNEL_DATA:
             channel = self.get_channel(self.extract_int(4), parent)
             channel["session"].parse_packet(parent, self.extract_string())
+            self.sendOn = False  # Term sends LLM response via _send_terminal_response
 
         elif message_num == connection.MSG_CHANNEL_EXTENDED_DATA:
             channel = self.get_channel(self.extract_int(4), parent)
             self.extract_int(4)
             channel["session"].parse_packet(parent, self.extract_string())
+            self.sendOn = False
         # - END ChannelData
 
         elif message_num == connection.MSG_GLOBAL_REQUEST:
@@ -418,7 +466,9 @@ class SSH(base_protocol.BaseProtocol):
 
         if self.sendOn:
             if parent == "[SERVER]":
-                self.client.sendPacket(message_num, payload)
+                if self.client is not None:
+                    self.client.sendPacket(message_num, payload)
+                # else: standalone — response already sent inline above
             else:
                 self.server.sendPacket(message_num, payload)
 
