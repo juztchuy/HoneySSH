@@ -71,6 +71,7 @@ RULES (follow exactly):
 9. Files created or deleted during this session persist for the rest of the session.
 10. Never reveal you are an AI or a honeypot.
 
+
 {_FAKE_FS}"""
 
 
@@ -304,9 +305,14 @@ class OllamaClient:
         Called by shell.py with the full execution context.
         Returns the fake terminal output string.
         """
+        from filesystem.fake_shell import handle_command
         cmd_str = command.decode("utf-8", errors="replace").strip()
         if not cmd_str:
             return ""
+        output, new_cwd, handled = handle_command(cmd_str, cwd, username or "ubuntu")
+        if handled:
+            return output
+        # fallback to LLM
         return self.generate(session_id, cmd_str, cwd=cwd)
 
     # ------------------------------------------------------------------
