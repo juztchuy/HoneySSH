@@ -5,7 +5,7 @@ Handles basic Linux commands locally so we don't rely on the LLM
 for everything (faster + more consistent).
 """
 
-from datetime import datetime
+import os
 
 # --------------------------------------------------
 # Fake filesystem structure
@@ -75,27 +75,97 @@ def fake_ls_la(path, username):
 
 
 def fake_cd(command, cwd):
-    target = command.split(" ", 1)[1].strip()
+    parts = command.split(" ", 1)
 
-    if target == "~":
+    if len(parts) == 1 or parts[1].strip() in ["", "~"]:
         return "/home/ubuntu", ""
 
-    if target == "/":
-        return "/", ""
+    target = parts[1].strip()
+
+    if target == ".":
+        return cwd, ""
+
+    if target == "..":
+        if cwd == "/":
+            return "/", ""
+        new_path = os.path.dirname(cwd.rstrip("/"))
+        return new_path if new_path else "/", ""
 
     if target.startswith("/"):
-        if target in FAKE_FS:
-            return target, ""
-        else:
-            return cwd, f"bash: cd: {target}: No such file or directory"
+        new_path = os.path.normpath(target)
+    else:
+        new_path = os.path.normpath(cwd.rstrip("/") + "/" + target)
 
-    # relative path
-    new_path = cwd.rstrip("/") + "/" + target
     if new_path in FAKE_FS:
         return new_path, ""
 
     return cwd, f"bash: cd: {target}: No such file or directory"
 
+
+
+def fake_mkdir(command, cwd):
+    name = command.split(" ", 1)[1].strip()
+
+    if "/" in name:
+        parent = os.path.normpath(cwd.rstrip("/") + "/" + os.path.dirname(name))
+        dirname = os.path.basename(name)
+    else:
+        parent = cwd
+        dirname = name
+
+    new_path = os.path.normpath(parent.rstrip("/") + "/" + dirname)
+
+    if parent not in FAKE_FS:
+        return f"mkdir: cannot create directory '{name}': No such file or directory"
+
+    if new_path in FAKE_FS:
+        return f"mkdir: cannot create directory '{name}': File exists"
+
+    FAKE_FS[parent]["dirs"].append(dirname)
+    FAKE_FS[new_path] = {"dirs": [], "files": []}
+    return ""
+
+
+def fake_touch(command, cwd):
+    name = command.split(" ", 1)[1].strip()
+
+    if "/" in name:
+        parent = os.path.normpath(cwd.rstrip("/") + "/" + os.path.dirname(name))
+        filename = os.path.basename(name)
+    else:
+        parent = cwd
+        filename = name
+
+    if parent not in FAKE_FS:
+        return f"touch: cannot touch '{name}': No such file or directory"
+
+    if filename not in FAKE_FS[parent]["files"]:
+        FAKE_FS[parent]["files"].append(filename)
+
+    return ""
+
+
+
+
+def fake_ls_recursive(path):
+    path = os.path.normpath(path)
+
+    if path not in FAKE_FS:
+        return f"ls: cannot access '{path}': No such file or directory"
+
+    lines = [f"{path}:"]
+    entry = FAKE_FS[path]
+    items = entry["dirs"] + entry["files"]
+
+    if items:
+        lines.append("\n".join(items))
+
+    for d in entry["dirs"]:
+        child_path = os.path.normpath(path.rstrip("/") + "/" + d)
+        lines.append("")
+        lines.append(fake_ls_recursive(child_path))
+
+    return "\n".join(lines)
 
 def fake_passwd():
     return """root:x:0:0:root:/root:/bin/bash
@@ -136,6 +206,20 @@ def handle_command(command, cwd, username="ubuntu"):
     if command.startswith("cd "):
         new_cwd, output = fake_cd(command, cwd)
         return output, new_cwd, True
+
+    if command.startswith("mkdir "):
+        return fake_mkdir(command, cwd), cwd, True
+
+    if command.startswith("touch "):
+        return fake_touch(command, cwd), cwd, True
+
+    if command.startswith("ls -R "):
+        target = command.split(" ", 2)[2].strip()
+        if target.startswith("/"):
+            path = os.path.normpath(target)
+        else:
+            path = os.path.normpath(cwd.rstrip("/") + "/" + target)
+        return fake_ls_recursive(path), cwd, True
 
     if command == "cat /etc/passwd":
         return fake_passwd(), cwd, True
