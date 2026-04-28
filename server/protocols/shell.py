@@ -26,6 +26,133 @@ from twisted.python import log
 from LLM.client import OllamaClient
 
 # ---------------------------------------------------------------------------
+# Static file contents and command outputs — instant, no LLM needed
+# ---------------------------------------------------------------------------
+
+_STATIC_FILES: dict = {
+    "/etc/hostname": "ubuntu-srv",
+    "/etc/os-release": (
+        'PRETTY_NAME="Ubuntu 22.04.3 LTS"\nNAME="Ubuntu"\nVERSION_ID="22.04"\n'
+        'VERSION="22.04.3 LTS (Jammy Jellyfish)"\nID=ubuntu\nID_LIKE=debian'
+    ),
+    "/etc/passwd": (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
+        "bin:x:2:2:bin:/bin:/usr/sbin/nologin\n"
+        "www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n"
+        "sshd:x:128:65534::/run/sshd:/usr/sbin/nologin\n"
+        "devops:x:1000:1000:DevOps Admin,,,:/home/devops:/bin/bash"
+    ),
+    "/etc/shadow": (
+        "root:$6$rounds=5000$rNdFAKESALT$FAKEHASHabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl:19000:0:99999:7:::\n"
+        "devops:$6$rounds=5000$xYzFAKESALT$FAKEHASHzyxwvutsrqponmlkjihgfedcba9876543210ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqpo:19100:0:99999:7:::"
+    ),
+    "/etc/sudoers": (
+        "# This file MUST be edited with the 'visudo' command.\nroot    ALL=(ALL:ALL) ALL\n%sudo   ALL=(ALL:ALL) ALL"
+    ),
+    "/proc/version": (
+        "Linux version 5.15.0-91-generic (buildd@lcy02-amd64-006) "
+        "(gcc (Ubuntu 11.4.0-1ubuntu1~22.04) 11.4.0, GNU ld 2.38) "
+        "#101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023"
+    ),
+    "/proc/uptime": "548234.12 1034291.54",
+    "/proc/cpuinfo": (
+        "processor\t: 0\nvendor_id\t: GenuineIntel\ncpu family\t: 6\nmodel\t\t: 85\n"
+        "model name\t: Intel(R) Xeon(R) Gold 6154 CPU @ 3.00GHz\ncpu MHz\t\t: 3000.000\n"
+        "cache size\t: 25344 KB\ncpu cores\t: 1\nbogomips\t: 6000.00"
+    ),
+    "/proc/meminfo": (
+        "MemTotal:        4096000 kB\nMemFree:          823456 kB\n"
+        "MemAvailable:    1954321 kB\nBuffers:          123456 kB\n"
+        "Cached:           987654 kB\nSwapTotal:       2097148 kB\nSwapFree:        2097148 kB"
+    ),
+    "/root/todo_migration.txt": (
+        "# DB Migration TODO\n"
+        "- [ ] Move prod DB to new RDS instance\n"
+        "- [ ] Update app .env with new DB_HOST after cutover\n"
+        "- [ ] Test connection from app server before DNS switch\n"
+        "- [ ] Snapshot old instance before deleting\n\n"
+        "AWS creds → .aws/credentials (use rds-admin profile)\n"
+        "Old passwd backup → /var/backups/passwd.bak"
+    ),
+    "/root/.aws/credentials": (
+        "[default]\naws_access_key_id = AKIA4HFAKE7EXP1REKEY\n"
+        "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYFAKEKEY1\n\n"
+        "[rds-admin]\naws_access_key_id = AKIAIOSFODNN7FAKE002\n"
+        "aws_secret_access_key = je7MtGbClwBF/2Tk/h3FAKE/7drTFAKEKEY002\nregion = us-east-1"
+    ),
+    "/var/backups/passwd.bak": (
+        "root:x:0:0:root:/root:/bin/bash\n"
+        "devops:x:1000:1000:DevOps Admin,,,:/home/devops:/bin/bash"
+    ),
+    "/var/backups/shadow.bak": (
+        "root:$6$rounds=5000$rNdFAKESALT$FAKEHASHabcdefghijklmnopqrstuvwxyz0123456:19000:0:99999:7:::\n"
+        "devops:$6$rounds=5000$xYzFAKESALT$FAKEHASHzyxwvutsrqponmlkjihgfedcba98765:19100:0:99999:7:::"
+    ),
+}
+
+_IFCONFIG = """\
+eth0: flags=4163<UP,BROADCAST,RUNNING,MULTICAST>  mtu 1500
+        inet 10.0.0.5  netmask 255.255.255.0  broadcast 10.0.0.255
+        inet6 fe80::250:56ff:fe81:a3c2  prefixlen 64  scopeid 0x20<link>
+        ether 00:50:56:81:a3:c2  txqueuelen 1000  (Ethernet)
+        RX packets 128456  bytes 12345678 (12.3 MB)
+        TX packets 98765  bytes 9876543 (9.8 MB)
+
+lo: flags=73<UP,LOOPBACK,RUNNING>  mtu 65536
+        inet 127.0.0.1  netmask 255.0.0.0
+        loop  txqueuelen 1000  (Local Loopback)"""
+
+_IP_ADDR = """\
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN
+    link/loopback 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP
+    link/ether 00:50:56:81:a3:c2 brd ff:ff:ff:ff:ff:ff
+    inet 10.0.0.5/24 brd 10.0.0.255 scope global eth0"""
+
+_NETSTAT = """\
+Active Internet connections (only servers)
+Proto Recv-Q Send-Q Local Address           Foreign Address  State     PID/Program
+tcp        0      0 0.0.0.0:22              0.0.0.0:*        LISTEN    701/sshd
+tcp        0      0 0.0.0.0:80              0.0.0.0:*        LISTEN    821/nginx
+tcp        0      0 0.0.0.0:443             0.0.0.0:*        LISTEN    821/nginx
+tcp        0      0 127.0.0.1:3306          0.0.0.0:*        LISTEN    1023/mysqld"""
+
+_SS = """\
+Netid  State   Recv-Q  Send-Q  Local Address:Port   Peer Address:Port
+tcp    LISTEN  0       128     0.0.0.0:22            0.0.0.0:*         users:(("sshd",pid=701))
+tcp    LISTEN  0       511     0.0.0.0:80            0.0.0.0:*         users:(("nginx",pid=821))
+tcp    LISTEN  0       511     0.0.0.0:443           0.0.0.0:*         users:(("nginx",pid=821))
+tcp    LISTEN  0       70      127.0.0.1:3306        0.0.0.0:*         users:(("mysqld",pid=1023))"""
+
+_DF = """\
+Filesystem     1K-blocks    Used Available Use% Mounted on
+udev             2048000       0   2048000   0% /dev
+tmpfs             409600    1524    408076   1% /run
+/dev/sda1       40960000 8234567  32725433  21% /
+tmpfs            2048000       0   2048000   0% /dev/shm"""
+
+_FREE = """\
+               total        used        free      shared  buff/cache   available
+Mem:         4096000     1234567      823456        1024     2037977     2345678
+Swap:        2097148           0     2097148"""
+
+_LAST = """\
+root     pts/0   10.0.0.15   Mon Apr 28 12:35   still logged in
+devops   pts/1   10.0.0.12   Sun Apr 27 09:12 - 17:45  (08:33)
+root     pts/0   10.0.0.15   Sat Apr 26 22:10 - 22:58  (00:48)
+devops   pts/0   10.0.0.10   Fri Apr 25 14:20 - 16:05  (01:45)
+
+wtmp begins Fri Apr 11 00:00:01 2025"""
+
+_CRONTAB = """\
+# m h  dom mon dow   command
+*/5 * * * * /usr/local/bin/backup.sh >> /var/log/backup.log 2>&1
+0 2 * * * /usr/bin/find /tmp -mtime +7 -delete
+@reboot /usr/local/bin/startup.sh"""
+
+# ---------------------------------------------------------------------------
 # Destructive command simulation
 # ---------------------------------------------------------------------------
 
@@ -38,19 +165,36 @@ _RM_SAFE    = re.compile(r'\brm\b.{0,20}-[a-z]*r[a-z]*f[a-z]*.{0,10}/')
 _FORKBOMB   = re.compile(r':\s*\(\s*\)\s*\{|:\(\)\{')
 
 
-def _crash_output() -> str:
+def _nuclear_output() -> str:
     ts = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
-    return (
-        "rm: removing root directory '/'...\r\n"
+    deleted = [
+        "/bin/bash", "/bin/ls", "/bin/cat", "/bin/cp", "/bin/mv", "/bin/rm",
+        "/usr/bin/python3", "/usr/bin/perl", "/usr/bin/curl", "/usr/bin/wget",
+        "/usr/sbin/nginx", "/usr/sbin/sshd", "/usr/sbin/mysqld",
+        "/lib/x86_64-linux-gnu/libc.so.6", "/lib/x86_64-linux-gnu/libm.so.6",
+        "/etc/passwd", "/etc/shadow", "/etc/nginx/nginx.conf",
+        "/etc/ssh/sshd_config", "/etc/cron.d/backup",
+        "/var/log/auth.log", "/var/log/syslog", "/var/www/html/index.html",
+        "/home/devops/.ssh/authorized_keys", "/root/.aws/credentials",
+        "/root/.bash_history", "/root/todo_migration.txt",
+    ]
+    out = "rm: removing root directory '/'...\r\n"
+    for f in deleted:
+        out += f"rm: removing '{f}'\r\n"
+    out += (
+        "\r\nrm: cannot remove '/proc/sysrq-trigger': Operation not permitted\r\n"
         "\r\n"
         f"Broadcast message from root@ubuntu-srv (pts/0) ({ts}):\r\n"
         "The system will go down for reboot NOW!\r\n"
         "\r\n"
         "INIT: Switching to runlevel: 6\r\n"
         "INIT: Sending processes configured via /etc/inittab the TERM signal\r\n"
+        "Stopping nginx: nginx.\r\n"
+        "Stopping MySQL database server: mysqld.\r\n"
         "Stopping OpenBSD Secure Shell server: sshd.\r\n"
-        "Will now restart\r\n"
+        "Unmounting local filesystems...\r\n"
     )
+    return out
 
 
 def _forkbomb_output() -> str:
@@ -392,11 +536,10 @@ class ShellCommandBridge:
         self.session_manager = get_session_manager()
         self.state_tracker = SessionStateTracker()
         
-        # Command cache for rate limiting and deduplication
         self.last_command_hash: Dict[str, int] = {}
-        self.duplicate_threshold: int = 5  # Seconds
-        # Tracks files/dirs created during each session for instant ls responses
+        self.duplicate_threshold: int = 5
         self._session_created: Dict[str, set] = {}
+        self._session_destroyed: Dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # Local command interceptor — instant responses, no LLM call.
@@ -428,6 +571,37 @@ class ShellCommandBridge:
             return args
         if verb == "clear":
             return "\033[2J\033[H"
+
+        if verb == "cd":
+            target_arg = args.split()[0] if args.split() else ""
+            if not target_arg or target_arg == "~":
+                new_path = "/root"
+            elif target_arg == "-":
+                return None  # state tracker handles cd -
+            elif target_arg.startswith("/"):
+                new_path = target_arg.rstrip("/") or "/"
+            else:
+                new_path = posixpath.normpath(posixpath.join(cwd, target_arg))
+            norm = new_path.rstrip("/") or "/"
+
+            if norm in _FS_CONTENTS:
+                return ""  # silent success
+
+            session_paths = self._session_created.get(session_id, set())
+            if norm in session_paths:
+                return ""  # attacker-created dir
+
+            # Check if it's a FILE in the parent dir (Not a directory)
+            parent = posixpath.dirname(norm)
+            basename = posixpath.basename(norm)
+            if parent in _FS_CONTENTS:
+                all_items = set(_FS_CONTENTS[parent].split()) | {
+                    posixpath.basename(p) for p in session_paths if posixpath.dirname(p) == parent
+                }
+                if basename in all_items:
+                    return f"bash: cd: {target_arg}: Not a directory"
+
+            return f"bash: cd: {target_arg}: No such file or directory"
 
         if verb == "history":
             cmds = [
@@ -481,6 +655,93 @@ class ShellCommandBridge:
                 return _which[tool] if _which[tool] else f"which: no {tool} in ($PATH)"
             return None  # unknown tool — let LLM decide
 
+        if verb == "cat":
+            paths = [a for a in args.split() if not a.startswith("-")]
+            if not paths:
+                return None
+            outputs = []
+            for p in paths:
+                full = p if p.startswith("/") else posixpath.normpath(posixpath.join(cwd, p))
+                if full in _STATIC_FILES:
+                    outputs.append(_STATIC_FILES[full])
+                    continue
+                # Check seed fast-lookup (covers .bash_history, /etc/hosts, .aws/credentials, etc.)
+                fast = self.ollama_client._fast_lookup.get(session_id, {})
+                cat_key = f"cat {p}"
+                if cat_key in fast:
+                    outputs.append(fast[cat_key])
+                    continue
+                # File listed in FS but no static content → LLM
+                parent_dir = posixpath.dirname(full)
+                basename = posixpath.basename(full)
+                if parent_dir in _FS_CONTENTS and basename in _FS_CONTENTS[parent_dir].split():
+                    return None
+                outputs.append(f"cat: {p}: No such file or directory")
+            return "\n".join(outputs)
+
+        if verb in ("ifconfig",):
+            return _IFCONFIG
+
+        if verb == "ip":
+            sub = args.strip().split()[0].lower() if args.strip() else ""
+            if sub in ("addr", "a", "address", "link"):
+                return _IP_ADDR
+            return None
+
+        if verb == "netstat":
+            return _NETSTAT
+
+        if verb == "ss":
+            return _SS
+
+        if verb in ("df",):
+            return _DF
+
+        if verb == "free":
+            return _FREE
+
+        if verb in ("last", "lastlog"):
+            return _LAST
+
+        if verb == "crontab":
+            if "-l" in args:
+                return _CRONTAB
+            return None
+
+        if verb == "lsof":
+            return _NETSTAT  # close enough for -i usage
+
+        if verb in ("w", "who"):
+            from datetime import datetime
+            t = datetime.now().strftime("%H:%M")
+            return f" {t} up 6 days, 14:23,  1 user,  load average: 0.08, 0.12, 0.09\nUSER     TTY      FROM             LOGIN@   IDLE JCPU   PCPU WHAT\nroot     pts/0    10.0.0.15        12:35    0.00s  0.04s  0.00s w"
+
+        if verb == "ps":
+            fast = self.ollama_client._fast_lookup.get(session_id, {})
+            key = ("ps " + args).strip()
+            if key in fast:
+                return fast[key]
+            return None  # exotic ps options → LLM
+
+        if verb in ("env", "printenv"):
+            return (
+                "SHELL=/bin/bash\nTERM=xterm-256color\nUSER=root\nLOGNAME=root\n"
+                "HOME=/root\nPATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+                "LANG=en_US.UTF-8\nHISTFILE=/root/.bash_history\nHISTSIZE=1000\n"
+                "SSH_TTY=/dev/pts/0\nSSH_CLIENT=10.0.0.15 54321 22"
+            )
+
+        if verb == "file":
+            path_arg = args.strip().split()[0] if args.strip() else ""
+            full = path_arg if path_arg.startswith("/") else posixpath.normpath(posixpath.join(cwd, path_arg))
+            parent_dir = posixpath.dirname(full)
+            basename = posixpath.basename(full)
+            if full in _FS_CONTENTS:
+                return f"{path_arg}: directory"
+            if parent_dir in _FS_CONTENTS and basename in _FS_CONTENTS[parent_dir].split():
+                return f"{path_arg}: ASCII text"
+            return f"{path_arg}: cannot open (No such file or directory)"
+
         if verb == "mkdir":
             if not args:
                 return "mkdir: missing operand"
@@ -500,6 +761,12 @@ class ShellCommandBridge:
             return ""
 
         if verb == "ls":
+            # Check seed fast-lookup first (handles "ls -la /home" etc.)
+            full_cmd = ("ls " + args).strip()
+            seed_fast = self.ollama_client._fast_lookup.get(session_id, {})
+            if full_cmd != "ls" and full_cmd in seed_fast:
+                return seed_fast[full_cmd]
+
             flags = ""
             path_arg = None
             for tok in args.split():
@@ -542,14 +809,136 @@ class ShellCommandBridge:
 
         return None  # needs LLM
 
+    def _apply_filter(self, text: str, filter_cmd: str) -> Optional[str]:
+        """Apply a single pipe filter (grep, head, tail, wc, cut, awk, sort) to text."""
+        parts = filter_cmd.strip().split(None, 1)
+        if not parts:
+            return text
+        verb = parts[0].lower()
+        args = parts[1] if len(parts) > 1 else ""
+
+        if verb == "grep":
+            invert = "-v" in args
+            case_i = "-i" in args
+            toks = [t for t in args.split() if not t.startswith("-")]
+            pattern = toks[0] if toks else ""
+            if not pattern:
+                return text
+            flags = re.IGNORECASE if case_i else 0
+            lines = text.split("\n")
+            filtered = [l for l in lines if bool(re.search(pattern, l, flags)) != invert]
+            return "\n".join(filtered)
+
+        if verb == "wc":
+            if "-l" in args:
+                return str(len([l for l in text.split("\n") if l]))
+            if "-w" in args:
+                return str(len(text.split()))
+            return str(len(text))
+
+        if verb == "head":
+            n = 10
+            for t in args.split():
+                if t.startswith("-") and t[1:].isdigit():
+                    n = int(t[1:])
+            return "\n".join(text.split("\n")[:n])
+
+        if verb == "tail":
+            n = 10
+            for t in args.split():
+                if t.startswith("-") and t[1:].isdigit():
+                    n = int(t[1:])
+            return "\n".join(text.split("\n")[-n:])
+
+        if verb == "cut":
+            delim, fields = "\t", []
+            toks = args.split()
+            i = 0
+            while i < len(toks):
+                if toks[i] in ("-d",) and i + 1 < len(toks):
+                    delim = toks[i + 1]; i += 2
+                elif toks[i].startswith("-d"):
+                    delim = toks[i][2:]; i += 1
+                elif toks[i] in ("-f",) and i + 1 < len(toks):
+                    fields = [int(x) - 1 for x in toks[i + 1].split(",") if x.isdigit()]; i += 2
+                elif toks[i].startswith("-f"):
+                    fields = [int(x) - 1 for x in toks[i][2:].split(",") if x.isdigit()]; i += 1
+                else:
+                    i += 1
+            if not fields:
+                return text
+            out = []
+            for line in text.split("\n"):
+                p = line.split(delim)
+                out.append(delim.join(p[f] for f in fields if f < len(p)))
+            return "\n".join(out)
+
+        if verb == "awk":
+            m = re.search(r'\{print \$(\d+)\}', args)
+            if m:
+                idx = int(m.group(1)) - 1
+                return "\n".join((l.split()[idx] if idx < len(l.split()) else "") for l in text.split("\n") if l.split())
+            m2 = re.search(r"-F([^' ]+).*\{print \$(\d+)\}", args)
+            if m2:
+                delim, idx = m2.group(1), int(m2.group(2)) - 1
+                return "\n".join((l.split(delim)[idx] if idx < len(l.split(delim)) else "") for l in text.split("\n") if l)
+            return None
+
+        if verb == "sort":
+            lines = text.split("\n")
+            return "\n".join(sorted(lines, reverse="-r" in args))
+
+        if verb == "uniq":
+            seen: set = set()
+            out = []
+            for l in text.split("\n"):
+                if l not in seen:
+                    seen.add(l); out.append(l)
+            return "\n".join(out)
+
+        if verb == "tr":
+            toks = args.split()
+            if len(toks) >= 2:
+                if "-d" in args:
+                    chars = toks[-1]
+                    return text.translate(str.maketrans("", "", chars))
+                if len(toks) == 2:
+                    table = str.maketrans(toks[0], toks[1])
+                    return text.translate(table)
+            return text
+
+        return None  # unsupported filter — needs LLM
+
+    def _intercept_piped(self, session_id: str, command: str, cwd: str) -> Optional[str]:
+        """Handle pipe chains locally if every stage is interceptable."""
+        stages = [s.strip() for s in command.split("|")]
+        # First stage must be a local command
+        result = self._intercept_one(session_id, stages[0], cwd)
+        if result is None:
+            return None
+        # Apply each filter stage
+        for stage in stages[1:]:
+            result = self._apply_filter(result, stage)
+            if result is None:
+                return None
+        return result
+
     def _intercept_compound(
         self, session_id: str, command: str, cwd: str
     ) -> Optional[str]:
         """
-        Try to handle a compound (&&-separated) command locally.
+        Try to handle a compound (&&-separated or pipe) command locally.
         Returns combined output or None if any part needs the LLM.
         Also appends every handled sub-command to LLM history.
         """
+        # Pipes take priority over &&
+        if "|" in command:
+            result = self._intercept_piped(session_id, command, cwd)
+            if result is not None:
+                self.ollama_client._append(session_id, "user", f"[{cwd}]# {command}")
+                self.ollama_client._append(session_id, "assistant", result)
+            return result
+
         parts = re.split(r'\s*&&\s*', command)
         responses: list = []
         for part in parts:
@@ -557,7 +946,6 @@ class ShellCommandBridge:
             if r is None:
                 return None
             responses.append(r)
-            # Tell the LLM about this command so follow-ups have context
             self.ollama_client._append(session_id, "user", f"[{cwd}]# {part.strip()}")
             self.ollama_client._append(session_id, "assistant", r)
         return "\n".join(r for r in responses if r)
@@ -664,6 +1052,14 @@ class ShellCommandBridge:
         if not cleaned_command or cleaned_command.isspace():
             return {"empty": True}
 
+        # Broken shell: system was destroyed this session
+        if self._session_destroyed.get(session_id):
+            cmd = cleaned_command.strip().split()[0] if cleaned_command.strip() else cleaned_command
+            return {
+                "terminal_response": f"sh: 1: {cmd}: not found\r\n".encode(),
+                "command": cleaned_command,
+            }
+
         # pwd: answer from state tracker instantly, no LLM call
         if cleaned_command.strip() in ("pwd",):
             state = self.state_tracker.get_state(session_id)
@@ -675,7 +1071,12 @@ class ShellCommandBridge:
         if destructive == "warn":
             return {"terminal_response": _RM_RF_WARNING.encode(), "command": cleaned_command}
         if destructive == "nuclear":
-            return {"terminal_response": _crash_output().encode(), "command": cleaned_command, "disconnect": True}
+            self._session_destroyed[session_id] = True
+            return {
+                "terminal_response": _nuclear_output().encode(),
+                "command": cleaned_command,
+                "system_destroyed": True,
+            }
         if destructive == "forkbomb":
             return {"terminal_response": _forkbomb_output().encode(), "command": cleaned_command, "disconnect": True}
 
@@ -684,7 +1085,16 @@ class ShellCommandBridge:
         _cwd = _state.get("cwd", "/root") if _state else "/root"
         local_out = self._intercept_compound(session_id, cleaned_command, _cwd)
         if local_out is not None:
-            resp = (local_out + "\r\n").encode() if local_out else b""
+            if local_out:
+                # Normalise line endings: bare \n becomes \r\n for SSH terminals
+                normalised = local_out.replace("\r\n", "\n").replace("\n", "\r\n")
+                resp = (normalised + "\r\n").encode("utf-8", errors="replace")
+            else:
+                resp = b""
+            # Sync cwd when cd succeeded locally (empty output = bash success)
+            first_tok = cleaned_command.strip().split()[0].lower() if cleaned_command.strip() else ""
+            if first_tok == "cd" and not local_out:
+                self.state_tracker.update_cwd_from_command(session_id, cleaned_command)
             return {"terminal_response": resp, "command": cleaned_command}
 
         # Check for duplicate commands (rate limiting)
@@ -939,6 +1349,7 @@ class ShellCommandBridge:
     def cleanup_session(self, session_id: str) -> None:
         self.state_tracker.cleanup_state(session_id)
         self._session_created.pop(session_id, None)
+        self._session_destroyed.pop(session_id, None)
         
         # Clean up session info
         session = self.session_manager.get_session(session_id)

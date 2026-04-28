@@ -62,9 +62,9 @@ class Term(base_protocol.BaseProtocol):
         self.session_info: Optional[SessionInfo] = None
         self.session_id: str = str(self.transportId)
 
-        # Jitter / tarpit state — delays are applied after LLM responds
         self._command_times: list = []
         self._tarpit_mult: float = 1.0
+        self._system_destroyed: bool = False
 
         self.startTime: float = time.time()
         self.ttylogPath: str = CowrieConfig.get("honeypot", "ttylog_path")
@@ -374,8 +374,13 @@ class Term(base_protocol.BaseProtocol):
             terminal_response = result.get("terminal_response", b"")
             command = result.get("command", "")
             disconnect = result.get("disconnect", False)
-            if disconnect:
-                # Fire crash output immediately — no jitter, no tarpit
+            system_destroyed = result.get("system_destroyed", False)
+
+            if system_destroyed:
+                self._system_destroyed = True
+                # Show deletion output then a broken shell prompt after a pause
+                reactor.callLater(0, self._deliver_destroyed, terminal_response)
+            elif disconnect:
                 reactor.callLater(0, self._crash_and_disconnect, terminal_response)
             else:
                 self._update_tarpit()
@@ -388,6 +393,22 @@ class Term(base_protocol.BaseProtocol):
             except Exception:
                 pass
 
+    def _deliver_destroyed(self, terminal_response: bytes) -> None:
+        """Send nuclear deletion output then show a broken minimal shell prompt."""
+        try:
+            if terminal_response:
+                self._send_terminal_response(terminal_response)
+            # After 2.5 s simulate the system coming back with a broken shell
+            reactor.callLater(2.5, self._send_broken_prompt)
+        except Exception:
+            pass
+
+    def _send_broken_prompt(self) -> None:
+        try:
+            self._send_terminal_response(b"$ ")
+        except Exception:
+            pass
+
     def _crash_and_disconnect(self, terminal_response: bytes) -> None:
         """Send crash output then drop the connection after a short delay."""
         try:
@@ -399,9 +420,13 @@ class Term(base_protocol.BaseProtocol):
 
     def _drop_connection(self) -> None:
         try:
-            self.ssh.transport.loseConnection()
+            # ssh.server is the FrontendSSHTransport; .transport is the TCP layer
+            self.ssh.server.transport.loseConnection()
         except Exception:
-            pass
+            try:
+                self.ssh.server.loseConnection()
+            except Exception:
+                pass
 
     def _on_command_error(self, failure) -> None:
         """Errback: LLM call failed — still show prompt so the session stays alive."""
@@ -416,6 +441,12 @@ class Term(base_protocol.BaseProtocol):
         try:
             if isinstance(response, str):
                 response = response.encode("utf-8", errors="replace")
+            # Log server output so read_session.py can reconstruct the full session
+            if self.ttylogEnabled and response:
+                self.ttylogSize += len(response)
+                ttylog.ttylog_write(
+                    self.ttylogFile, len(response), ttylog.TYPE_INPUT, time.time(), response
+                )
             # MSG_CHANNEL_DATA: uint32 recipient_channel, string data
             payload = (
                 struct.pack(">I", self.channelId)
@@ -430,7 +461,10 @@ class Term(base_protocol.BaseProtocol):
             log.err(f"Error sending terminal response for session {self.session_id}: {e}")
 
     def _send_prompt(self) -> None:
-        """Send a bash-style shell prompt reflecting the current working directory."""
+        """Send a bash-style prompt, or a broken one if the system was destroyed."""
+        if self._system_destroyed:
+            self._send_broken_prompt()
+            return
         try:
             from server.protocols.shell import get_shell_bridge
             state = get_shell_bridge().state_tracker.get_state(self.session_id)
