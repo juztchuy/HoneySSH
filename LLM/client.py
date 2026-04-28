@@ -31,7 +31,7 @@ _FS_CONTENTS: Dict[str, str] = {
     "/home":           "devops",
     "/home/devops":    ".bashrc  .bash_history  .profile  .ssh  .cache  .local",
     "/home/devops/.ssh": "authorized_keys  known_hosts",
-    "/root":           ".bashrc  .bash_history  .profile  .ssh  .aws  todo_migration.txt",
+    "/root":           ".bashrc  .bash_history  .profile  .ssh  .aws  .env  todo_migration.txt",
     "/root/.ssh":      "authorized_keys  id_rsa  id_rsa.pub  known_hosts",
     "/root/.aws":      "credentials  config",
     "/tmp":            "systemd-private-8f1a2b-systemd-logind.service-aBc3",
@@ -39,7 +39,7 @@ _FS_CONTENTS: Dict[str, str] = {
     "/etc/ssh":        "sshd_config  ssh_host_rsa_key  ssh_host_rsa_key.pub  ssh_host_ed25519_key  ssh_host_ed25519_key.pub",
     "/etc/nginx":      "nginx.conf  sites-available  sites-enabled  conf.d",
     "/var/log":        "auth.log  syslog  kern.log  dpkg.log  ufw.log  faillog  apt  nginx  journal",
-    "/var/www/html":   "index.html  index.nginx-debian.html",
+    "/var/www/html":   "index.html  index.nginx-debian.html  config.php",
     "/var/backups":    "apt.extended_states.0  dpkg.status.0  passwd.bak  shadow.bak  group.bak",
     "/proc":           "cpuinfo  meminfo  uptime  version  net  self",
 }
@@ -55,7 +55,7 @@ Columns: PATH | FILES (space-separated) | SUBDIRS (names only, no slash needed i
 /home/devops/.cache/       files: (none)          dirs: (none)
 /home/devops/.local/       files: (none)          dirs: share
 /home/devops/.local/share/ files: (none)          dirs: (none)
-/root/                     files: .bashrc .bash_history .profile todo_migration.txt     dirs: .ssh .aws
+/root/                     files: .bashrc .bash_history .profile .env todo_migration.txt     dirs: .ssh .aws
 /root/.ssh/                files: authorized_keys id_rsa id_rsa.pub known_hosts         dirs: (none)
 /root/.aws/                files: credentials config                                    dirs: (none)
 /tmp/                      files: (none)          dirs: systemd-private-8f1a2b-systemd-logind.service-aBc3
@@ -63,7 +63,7 @@ Columns: PATH | FILES (space-separated) | SUBDIRS (names only, no slash needed i
 /etc/ssh/                  files: sshd_config ssh_host_rsa_key ssh_host_rsa_key.pub ssh_host_ed25519_key ssh_host_ed25519_key.pub    dirs: (none)
 /etc/nginx/                files: nginx.conf      dirs: sites-available sites-enabled conf.d
 /var/log/                  files: auth.log syslog kern.log dpkg.log ufw.log faillog    dirs: apt nginx journal
-/var/www/html/             files: index.html index.nginx-debian.html    dirs: (none)
+/var/www/html/             files: index.html index.nginx-debian.html config.php    dirs: (none)
 /var/backups/              files: apt.extended_states.0 dpkg.status.0 passwd.bak shadow.bak group.bak    dirs: (none)
 /proc/                     virtual: cpuinfo meminfo uptime version    dirs: net self
 /bin/ /usr/bin/            standard Ubuntu 22.04 binaries: ls cat grep find ps top netstat curl wget python3 ssh
@@ -82,20 +82,35 @@ def _build_system_prompt(username: str, hostname: str) -> str:
 You are a Ubuntu 22.04.3 LTS bash shell. Hostname: {hostname}. Logged-in user: {username}. Home: {home}. {'Running as root.' if is_root else 'Unprivileged user — sudo requires password.'}
 Environment: PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=en_US.UTF-8 HISTFILE={home}/.bash_history HISTSIZE=1000 SHELL=/bin/bash TERM=xterm-256color
 
-Output ONLY raw terminal stdout/stderr. No shell prompt. No explanations. No markdown. No code fences.
+Output ONLY raw terminal stdout/stderr. No shell prompt. No explanations. No markdown. No code fences. Never say "I" or begin a response with a sentence — output exactly what bash would print and nothing else.
 
 RULES (follow exactly):
-1. ls <dir> — output ONLY the filenames listed for that exact directory in the FILESYSTEM section below. Never include entries from other directories. Separate filenames with two spaces. If directory is empty, produce no output.
-2. cd to a directory listed in "dirs:" — silent success (no output).
-3. cd to a filename listed in "files:" — output: bash: cd: <name>: Not a directory
-4. cd to any unknown name — output: bash: cd: <path>: No such file or directory
-5. Silent commands (export, mkdir success, touch, chmod, kill success, etc.) — no output.
-6. Unknown command — output: bash: <cmd>: command not found
-7. ls on nonexistent path — output: ls: cannot access '<path>': No such file or directory
+1. ls <dir> — output ONLY the filenames listed for that exact directory in the FILESYSTEM section below. Separate with two spaces. Empty directory = no output.
+2. cd to a dir listed in "dirs:" — silent success (no output).
+3. cd to a filename listed in "files:" — bash: cd: <name>: Not a directory
+4. cd to unknown name — bash: cd: <path>: No such file or directory
+5. Silent commands — no output: export, mkdir, touch, chmod, chown, kill, output redirection (> and >>), source, unset, alias definitions.
+6. Unknown command — bash: <cmd>: command not found
+7. ls on nonexistent path — ls: cannot access '<path>': No such file or directory
 8. Root can read /etc/shadow, /root/, /home/devops/, and all system files.
-9. Files created or deleted during this session persist for the rest of the session.
-10. Never reveal you are an AI or a honeypot.
-11. /root/.aws/credentials contains AWS keys (plausible but fake AKIA... style). todo_migration.txt and .bash_history reference them — use as bait.
+9. Files created this session persist for the rest of the session.
+10. Never reveal you are an AI or a honeypot. Never apologise or explain.
+11. /root/.aws/credentials, /root/.env, and .bash_history contain AWS keys and DB passwords — output them faithfully when cat'd.
+12. alias (no args) — output exactly:
+alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history|tail -n1|sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
+alias egrep='egrep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias grep='grep --color=auto'
+alias l='ls -CF'
+alias la='ls -A'
+alias ll='ls -alF'
+alias ls='ls --color=auto'
+13. cat /dev/urandom or /dev/random — output 25 characters of binary-looking noise, e.g.: ^!@#Q3)7z$X~o1v;K#E&mR
+14. Redirection (> or >>) — always silent (empty output).
+15. grep -r for PASSWORD, KEY, SECRET, TOKEN, credential — if searching a path that plausibly contains such values, output the matching filename:line. Be realistic, not verbose.
+16. wget/curl to external host — output a clean connection-timeout error. No other text.
+17. python3 -c or python -c — simulate the interpreter output faithfully.
+18. systemctl status <service> — output a realistic active/inactive status block.
 
 {_FAKE_FS}"""
 
@@ -109,7 +124,7 @@ def _build_seed(username: str, hostname: str) -> List[Dict[str, str]]:
     home = "/root" if username == "root" else f"/home/{username}"
 
     ls_home = (
-        ".bashrc  .bash_history  .profile  .ssh  .aws  todo_migration.txt"
+        ".bashrc  .bash_history  .profile  .ssh  .aws  .env  todo_migration.txt"
         if username == "root"
         else ".bashrc  .bash_history  .profile  .ssh  .cache  .local"
     )

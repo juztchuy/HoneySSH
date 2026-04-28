@@ -66,6 +66,16 @@ _STATIC_FILES: dict = {
         "MemAvailable:    1954321 kB\nBuffers:          123456 kB\n"
         "Cached:           987654 kB\nSwapTotal:       2097148 kB\nSwapFree:        2097148 kB"
     ),
+    "/root/.env": (
+        "DB_HOST=127.0.0.1\n"
+        "DB_USER=app_user\n"
+        "DB_PASSWORD=Pr0d@ppP@ss2023!\n"
+        "DB_NAME=webapp_prod\n"
+        "JWT_SECRET=f8a4d3b2e1c96057fa31\n"
+        "AWS_ACCESS_KEY_ID=AKIA4HFAKE7EXP1REKEY\n"
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYFAKEKEY1\n"
+        "REDIS_URL=redis://10.0.0.6:6379/0"
+    ),
     "/root/todo_migration.txt": (
         "# DB Migration TODO\n"
         "- [ ] Move prod DB to new RDS instance\n"
@@ -88,6 +98,27 @@ _STATIC_FILES: dict = {
     "/var/backups/shadow.bak": (
         "root:$6$rounds=5000$rNdFAKESALT$FAKEHASHabcdefghijklmnopqrstuvwxyz0123456:19000:0:99999:7:::\n"
         "devops:$6$rounds=5000$xYzFAKESALT$FAKEHASHzyxwvutsrqponmlkjihgfedcba98765:19100:0:99999:7:::"
+    ),
+    "/var/www/html/config.php": (
+        "<?php\n"
+        "// Application configuration\n"
+        "define('DB_HOST', '127.0.0.1');\n"
+        "define('DB_USER', 'app_user');\n"
+        "define('DB_PASSWORD', 'Pr0d@ppP@ss2023!');\n"
+        "define('DB_NAME', 'webapp_prod');\n"
+        "define('APP_SECRET', 'c3f8a9d2e7b14056f31a');\n"
+        "define('S3_BUCKET', 'prod-backups-2023');\n"
+        "?>"
+    ),
+    # /dev/urandom: return garbled-looking noise instead of "No such file"
+    "/dev/urandom": (
+        "Q3)7!z$Xo1v;K#E8&mR{T5Hf2?kc.bN9>As0^jG6@Lp|d*Yw<"
+        "4WnI_F7!xMZq%rU~B8+eV2s{C1=h3OtP6,gJ)l9yD0-uaS5#kN"
+        ">7R@Xf!3Q$m*T8Lv1bKzW4pIoH2c%Ej^9y0dG6~nA|Bs;Ft<2R"
+    ),
+    "/dev/random": (
+        "Q3)7!z$Xo1v;K#E8&mR{T5Hf2?kc.bN9>As0^jG6@Lp|d*Yw<"
+        "4WnI_F7!xMZq%rU~B8+eV2s{C1=h3OtP6,gJ)l9yD0-uaS5#kN"
     ),
 }
 
@@ -127,11 +158,13 @@ tcp    LISTEN  0       511     0.0.0.0:443           0.0.0.0:*         users:(("
 tcp    LISTEN  0       70      127.0.0.1:3306        0.0.0.0:*         users:(("mysqld",pid=1023))"""
 
 _DF = """\
-Filesystem     1K-blocks    Used Available Use% Mounted on
-udev             2048000       0   2048000   0% /dev
-tmpfs             409600    1524    408076   1% /run
-/dev/sda1       40960000 8234567  32725433  21% /
-tmpfs            2048000       0   2048000   0% /dev/shm"""
+Filesystem      Size  Used Avail Use% Mounted on
+udev            2.0G     0  2.0G   0% /dev
+tmpfs           400M  1.5M  399M   1% /run
+/dev/sda1        40G  7.9G   32G  21% /
+tmpfs           2.0G     0  2.0G   0% /dev/shm
+tmpfs           5.0M     0  5.0M   0% /run/lock
+/dev/sda15      105M  6.1M   99M   6% /boot/efi"""
 
 _FREE = """\
                total        used        free      shared  buff/cache   available
@@ -561,13 +594,40 @@ class ShellCommandBridge:
 
         if verb == "whoami":
             return "root"
+        if verb == "hostname":
+            meta = self.ollama_client._session_meta.get(session_id, {})
+            return meta.get("hostname", "ubuntu-srv")
+        if verb == "pwd":
+            return cwd
         if verb == "id":
             return "uid=0(root) gid=0(root) groups=0(root)"
-        if verb in ("export", "unset", "alias", "unalias", "source", "."):
+        if verb in ("export", "unset", "unalias", "source", "."):
             return ""
+        if verb == "alias":
+            if args:
+                return ""  # alias definition — silent
+            return (
+                "alias alert='notify-send --urgency=low -i "
+                "\"$([ $? = 0 ] && echo terminal || echo error)\" "
+                "\"$(history|tail -n1|sed -e 's/^\\s*[0-9]\\+\\s*//;s/[;&|]\\s*alert$//')\"'\n"
+                "alias egrep='egrep --color=auto'\n"
+                "alias fgrep='fgrep --color=auto'\n"
+                "alias grep='grep --color=auto'\n"
+                "alias l='ls -CF'\n"
+                "alias la='ls -A'\n"
+                "alias ll='ls -alF'\n"
+                "alias ls='ls --color=auto'"
+            )
         if verb in ("chmod", "chown", "chgrp", "kill", "killall", "rm"):
             return ""
         if verb == "echo":
+            # Handle output redirection silently and track the created file
+            for redir in (">>", ">"):
+                if redir in args:
+                    file_part = args.split(redir, 1)[1].strip()
+                    full_path = posixpath.normpath(posixpath.join(cwd, file_part))
+                    self._session_created.setdefault(session_id, set()).add(full_path)
+                    return ""
             return args
         if verb == "clear":
             return "\033[2J\033[H"
@@ -760,6 +820,68 @@ class ShellCommandBridge:
                 self._session_created.setdefault(session_id, set()).add(full)
             return ""
 
+        if verb in ("wget", "curl"):
+            url_match = re.search(r'https?://\S+', args)
+            url_str = url_match.group() if url_match else args.strip()
+            host = url_str.split("//")[-1].split("/")[0]
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if verb == "wget":
+                return (
+                    f"--{now}--  {url_str}\n"
+                    f"Resolving {host} ({host})... 203.0.113.42\n"
+                    f"Connecting to {host} ({host})|203.0.113.42|:80... "
+                    f"failed: Connection timed out.\n\n"
+                    f"FINISHED --{now}--\n"
+                    f"Total wall clock time: 30s\n"
+                    f"Downloaded: 0 files, 0 in 0s (0 B/s)"
+                )
+            else:
+                return f"curl: (6) Could not resolve host: {host}"
+
+        if verb in ("python3", "python"):
+            m = re.match(r"""-c\s+["']print\(["']([^"']*)["']\)["']""", args)
+            if m:
+                return m.group(1)
+            return None
+
+        if verb == "grep":
+            recursive = "-r" in args or "-R" in args
+            if not recursive:
+                return None
+            case_i_flag = "-i" in args
+            re_flags_g = re.IGNORECASE if case_i_flag else 0
+            toks = args.split()
+            non_flags = [t for t in toks if not t.startswith("-")]
+            if not non_flags:
+                return None
+            pattern = non_flags[0].strip("\"'")
+            sp = non_flags[1] if len(non_flags) > 1 else "."
+            if sp in (".", "~"):
+                search_root = cwd
+            elif sp.startswith("/"):
+                search_root = sp.rstrip("/") or "/"
+            else:
+                search_root = posixpath.normpath(posixpath.join(cwd, sp))
+            results = []
+            for fpath, content in _STATIC_FILES.items():
+                norm_fp = fpath.rstrip("/")
+                if not (norm_fp == search_root or norm_fp.startswith(search_root + "/")):
+                    continue
+                for line in content.split("\n"):
+                    if re.search(pattern, line, re_flags_g):
+                        cwd_clean = cwd.rstrip("/")
+                        rel = ("." + norm_fp[len(cwd_clean):]) if norm_fp.startswith(cwd_clean + "/") else norm_fp
+                        results.append(f"{rel}:{line}")
+            fast = self.ollama_client._fast_lookup.get(session_id, {})
+            bash_hist = fast.get("cat .bash_history", "")
+            if bash_hist:
+                hist_abs = posixpath.join(cwd, ".bash_history")
+                if hist_abs.startswith(search_root) or search_root == cwd:
+                    for line in bash_hist.split("\n"):
+                        if re.search(pattern, line, re_flags_g):
+                            results.append(f"./.bash_history:{line}")
+            return "\n".join(results)
+
         if verb == "ls":
             # Check seed fast-lookup first (handles "ls -la /home" etc.)
             full_cmd = ("ls " + args).strip()
@@ -939,7 +1061,7 @@ class ShellCommandBridge:
                 self.ollama_client._append(session_id, "assistant", result)
             return result
 
-        parts = re.split(r'\s*&&\s*', command)
+        parts = re.split(r'\s*(?:&&|;)\s*', command)
         responses: list = []
         for part in parts:
             r = self._intercept_one(session_id, part.strip(), cwd)
