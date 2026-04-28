@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import struct
 import time
 from typing import Optional
@@ -61,6 +62,10 @@ class Term(base_protocol.BaseProtocol):
         self.session_info: Optional[SessionInfo] = None
         self.session_id: str = str(self.transportId)
 
+        # Jitter / tarpit state — delays are applied after LLM responds
+        self._command_times: list = []
+        self._tarpit_mult: float = 1.0
+
         self.startTime: float = time.time()
         self.ttylogPath: str = CowrieConfig.get("honeypot", "ttylog_path")
         self.ttylogEnabled: bool = CowrieConfig.getboolean(
@@ -79,12 +84,7 @@ class Term(base_protocol.BaseProtocol):
         # username they authenticated with.  Root logins are redirected to
         # the 'ubuntu' account; this forces privilege escalation attempts
         # and generates more realistic attacker behaviour data.
-        shell_user = (
-            "ubuntu"
-            if not self.username or self.username.lower() in ("root", "admin", "administrator")
-            else self.username
-        )
-        initialize_llm_session(self.session_id, username=shell_user)
+        initialize_llm_session(self.session_id, username="root")
 
         # Send the initial shell prompt on the next reactor tick (after
         # MSG_CHANNEL_SUCCESS has been flushed to the attacker).
@@ -324,19 +324,84 @@ class Term(base_protocol.BaseProtocol):
                     data,
                 )
 
-    def _on_command_result(self, result: dict) -> None:
-        """Callback: LLM responded — send output then prompt."""
+    def _compute_jitter(self, command: str) -> float:
+        """Return a realistic per-command delay in seconds (applied after LLM responds)."""
+        cmd = command.strip().split()[0].lower() if command.strip() else ""
+        if cmd in ("cd", "pwd", "clear", "exit", "logout", "export", "unset", "alias"):
+            base = random.uniform(0.04, 0.12)
+        elif cmd in ("echo", "true", "false", "test", ":"):
+            base = random.uniform(0.02, 0.07)
+        elif cmd in ("ls", "whoami", "id", "hostname", "uname", "date", "uptime", "history"):
+            base = random.uniform(0.08, 0.28)
+        elif cmd in ("cat", "head", "tail", "more", "less", "wc", "sort", "diff"):
+            base = random.uniform(0.12, 0.45)
+        elif cmd in ("grep", "awk", "sed", "cut", "tr", "xargs"):
+            base = random.uniform(0.18, 0.65)
+        elif cmd in ("find", "locate", "du", "df", "fdisk", "lsblk"):
+            base = random.uniform(0.9, 2.8)
+        elif cmd in ("ps", "top", "htop", "netstat", "ss", "lsof", "who", "w", "last"):
+            base = random.uniform(0.25, 0.7)
+        elif cmd in ("apt", "apt-get", "dpkg", "pip", "pip3", "npm", "curl", "wget"):
+            base = random.uniform(0.6, 1.8)
+        else:
+            base = random.uniform(0.1, 0.4)
+        return base * self._tarpit_mult
+
+    def _update_tarpit(self) -> None:
+        """Ramp delay multiplier when commands arrive faster than a human would type."""
+        now = time.time()
+        self._command_times.append(now)
+        self._command_times = [t for t in self._command_times if now - t < 60]
+        if len(self._command_times) >= 5:
+            avg_interval = (self._command_times[-1] - self._command_times[-5]) / 4
+            if avg_interval < 1.5:
+                self._tarpit_mult = min(self._tarpit_mult * 1.3, 8.0)
+            else:
+                self._tarpit_mult = max(self._tarpit_mult * 0.85, 1.0)
+
+    def _deliver_result(self, terminal_response: bytes) -> None:
+        """Send the buffered LLM output + prompt (called via reactor.callLater)."""
         try:
-            terminal_response = result.get("terminal_response", b"")
             if terminal_response:
                 self._send_terminal_response(terminal_response)
             self._send_prompt()
+        except Exception as exc:
+            log.err(f"Error delivering result (session {self.session_id}): {exc}")
+
+    def _on_command_result(self, result: dict) -> None:
+        """Callback: LLM responded — apply jitter then send output and prompt."""
+        try:
+            terminal_response = result.get("terminal_response", b"")
+            command = result.get("command", "")
+            disconnect = result.get("disconnect", False)
+            if disconnect:
+                # Fire crash output immediately — no jitter, no tarpit
+                reactor.callLater(0, self._crash_and_disconnect, terminal_response)
+            else:
+                self._update_tarpit()
+                delay = self._compute_jitter(command)
+                reactor.callLater(delay, self._deliver_result, terminal_response)
         except Exception as exc:
             log.err(f"Error in command result handler (session {self.session_id}): {exc}")
             try:
                 self._send_prompt()
             except Exception:
                 pass
+
+    def _crash_and_disconnect(self, terminal_response: bytes) -> None:
+        """Send crash output then drop the connection after a short delay."""
+        try:
+            if terminal_response:
+                self._send_terminal_response(terminal_response)
+            reactor.callLater(1.5, self._drop_connection)
+        except Exception:
+            pass
+
+    def _drop_connection(self) -> None:
+        try:
+            self.ssh.transport.loseConnection()
+        except Exception:
+            pass
 
     def _on_command_error(self, failure) -> None:
         """Errback: LLM call failed — still show prompt so the session stays alive."""

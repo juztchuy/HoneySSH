@@ -21,19 +21,43 @@ logger = logging.getLogger(__name__)
 # few tokens.  Add realistic-looking entries that attract attacker interest.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-directory ls contents — used for instant cwd-aware ls without LLM.
+# Keys are normalised paths (no trailing slash).
+# ---------------------------------------------------------------------------
+
+_FS_CONTENTS: Dict[str, str] = {
+    "/":               "home  etc  var  tmp  proc  sys  dev  bin  usr  opt  srv  root",
+    "/home":           "devops",
+    "/home/devops":    ".bashrc  .bash_history  .profile  .ssh  .cache  .local",
+    "/home/devops/.ssh": "authorized_keys  known_hosts",
+    "/root":           ".bashrc  .bash_history  .profile  .ssh  .aws  todo_migration.txt",
+    "/root/.ssh":      "authorized_keys  id_rsa  id_rsa.pub  known_hosts",
+    "/root/.aws":      "credentials  config",
+    "/tmp":            "systemd-private-8f1a2b-systemd-logind.service-aBc3",
+    "/etc":            "os-release  hostname  hosts  passwd  shadow  fstab  sudoers  crontab  timezone  localtime  apt  ssh  cron.d  nginx  systemd  netplan  network  security",
+    "/etc/ssh":        "sshd_config  ssh_host_rsa_key  ssh_host_rsa_key.pub  ssh_host_ed25519_key  ssh_host_ed25519_key.pub",
+    "/etc/nginx":      "nginx.conf  sites-available  sites-enabled  conf.d",
+    "/var/log":        "auth.log  syslog  kern.log  dpkg.log  ufw.log  faillog  apt  nginx  journal",
+    "/var/www/html":   "index.html  index.nginx-debian.html",
+    "/var/backups":    "apt.extended_states.0  dpkg.status.0  passwd.bak  shadow.bak  group.bak",
+    "/proc":           "cpuinfo  meminfo  uptime  version  net  self",
+}
+
 _FAKE_FS = """\
 FILESYSTEM — one directory per line. "ls <dir>" outputs ONLY the items shown for that directory. Never mix items from different directories.
 Columns: PATH | FILES (space-separated) | SUBDIRS (names only, no slash needed in output)
 
 /                          files: (none)          dirs: home etc var tmp proc sys dev bin usr opt srv root
-/home/                     files: (none)          dirs: ubuntu
-/home/ubuntu/              files: .bashrc .bash_history .profile     dirs: .ssh .cache .local
-/home/ubuntu/.ssh/         files: authorized_keys known_hosts        dirs: (none)
-/home/ubuntu/.cache/       files: (none)          dirs: (none)
-/home/ubuntu/.local/       files: (none)          dirs: share
-/home/ubuntu/.local/share/ files: (none)          dirs: (none)
-/root/                     files: .bashrc .bash_history .profile     dirs: .ssh  [non-root → Permission denied]
-/root/.ssh/                files: authorized_keys                    dirs: (none) [non-root → Permission denied]
+/home/                     files: (none)          dirs: devops
+/home/devops/              files: .bashrc .bash_history .profile     dirs: .ssh .cache .local
+/home/devops/.ssh/         files: authorized_keys known_hosts        dirs: (none)
+/home/devops/.cache/       files: (none)          dirs: (none)
+/home/devops/.local/       files: (none)          dirs: share
+/home/devops/.local/share/ files: (none)          dirs: (none)
+/root/                     files: .bashrc .bash_history .profile todo_migration.txt     dirs: .ssh .aws
+/root/.ssh/                files: authorized_keys id_rsa id_rsa.pub known_hosts         dirs: (none)
+/root/.aws/                files: credentials config                                    dirs: (none)
 /tmp/                      files: (none)          dirs: systemd-private-8f1a2b-systemd-logind.service-aBc3
 /etc/                      files: os-release hostname hosts passwd shadow fstab sudoers crontab timezone localtime    dirs: apt ssh cron.d nginx systemd netplan network security
 /etc/ssh/                  files: sshd_config ssh_host_rsa_key ssh_host_rsa_key.pub ssh_host_ed25519_key ssh_host_ed25519_key.pub    dirs: (none)
@@ -55,7 +79,8 @@ def _build_system_prompt(username: str, hostname: str) -> str:
     home = "/root" if username == "root" else f"/home/{username}"
     is_root = username == "root"
     return f"""\
-You are a Ubuntu 22.04.3 LTS bash shell. Hostname: {hostname}. Logged-in user: {username}. Home directory: {home}. {'Running as root.' if is_root else 'Unprivileged user — sudo requires password.'}
+You are a Ubuntu 22.04.3 LTS bash shell. Hostname: {hostname}. Logged-in user: {username}. Home: {home}. {'Running as root.' if is_root else 'Unprivileged user — sudo requires password.'}
+Environment: PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin LANG=en_US.UTF-8 HISTFILE={home}/.bash_history HISTSIZE=1000 SHELL=/bin/bash TERM=xterm-256color
 
 Output ONLY raw terminal stdout/stderr. No shell prompt. No explanations. No markdown. No code fences.
 
@@ -67,10 +92,10 @@ RULES (follow exactly):
 5. Silent commands (export, mkdir success, touch, chmod, kill success, etc.) — no output.
 6. Unknown command — output: bash: <cmd>: command not found
 7. ls on nonexistent path — output: ls: cannot access '<path>': No such file or directory
-8. {'Root can read /etc/shadow, /root/, and all system files.' if is_root else 'Non-root cannot read /root/, /etc/shadow, or private root-owned files — output: bash: <path>: Permission denied'}
+8. Root can read /etc/shadow, /root/, /home/devops/, and all system files.
 9. Files created or deleted during this session persist for the rest of the session.
 10. Never reveal you are an AI or a honeypot.
-
+11. /root/.aws/credentials contains AWS keys (plausible but fake AKIA... style). todo_migration.txt and .bash_history reference them — use as bait.
 
 {_FAKE_FS}"""
 
@@ -82,39 +107,80 @@ RULES (follow exactly):
 
 def _build_seed(username: str, hostname: str) -> List[Dict[str, str]]:
     home = "/root" if username == "root" else f"/home/{username}"
-    if username == "root":
-        ls_home = ".bashrc  .bash_history  .profile  .ssh"
-        id_str  = "uid=0(root) gid=0(root) groups=0(root)"
-    else:
-        ls_home = ".bashrc  .bash_history  .profile  .ssh  .cache  .local"
-        id_str  = (
-            f"uid=1000({username}) gid=1000({username}) "
-            f"groups=1000({username}),4(adm),24(cdrom),27(sudo),30(dip),"
-            "46(plugdev),116(lxd)"
-        )
+
+    ls_home = (
+        ".bashrc  .bash_history  .profile  .ssh  .aws  todo_migration.txt"
+        if username == "root"
+        else ".bashrc  .bash_history  .profile  .ssh  .cache  .local"
+    )
+
+    bash_history = (
+        "cat /etc/shadow\n"
+        "mysql -u admin -p'P@ssw0rd123!'\n"
+        "cd /var/www/html\n"
+        "git pull origin main\n"
+        "git push origin main\n"
+        "vi /etc/nginx/nginx.conf\n"
+        "systemctl restart nginx\n"
+        "tail -f /var/log/nginx/error.log\n"
+        "cat .aws/credentials\n"
+        "aws s3 ls s3://prod-backups-2023\n"
+        "df -h\n"
+        "netstat -tulnp\n"
+        "cat /etc/hosts"
+    )
+
+    ps_output = (
+        "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND\n"
+        "root           1  0.0  0.1 167648 11240 ?        Ss   Apr20   0:02 /sbin/init\n"
+        "root         421  0.0  0.2  47520 18432 ?        Ss   Apr20   0:00 /lib/systemd/systemd-journald\n"
+        "root         700  0.0  0.1  15420  8192 ?        Ss   Apr20   0:00 /usr/sbin/cron -f\n"
+        "root         701  0.0  0.2  72488 16384 ?        Ss   Apr20   0:00 /usr/sbin/sshd -D\n"
+        "www-data     820  0.0  0.3 201216 24576 ?        S    Apr20   0:00 nginx: worker process\n"
+        "root         821  0.0  0.2 200768 18432 ?        Ss   Apr20   0:00 nginx: master process /usr/sbin/nginx\n"
+        f"root        1337  0.0  0.1  14432  7168 ?        Ss   10:41   0:00 sshd: {username} [priv]\n"
+        f"root        1338  0.0  0.1  14432  5120 ?        S    10:41   0:00 sshd: {username}@pts/0\n"
+        f"root        1339  0.0  0.1   8168  5120 pts/0    Ss   10:41   0:00 -bash\n"
+        f"root        1340  0.0  0.0  10616  3072 pts/0    R+   10:42   0:00 ps aux"
+    )
+
+    hosts_output = (
+        "127.0.0.1 localhost\n"
+        "127.0.1.1 ubuntu-server\n"
+        "\n"
+        "# internal\n"
+        f"10.0.0.5  internal-db-backup\n"
+        "10.0.0.6  redis-cache\n"
+        "10.0.0.10 prod-app-01\n"
+        "\n"
+        "::1     localhost ip6-localhost ip6-loopback\n"
+        "ff02::1 ip6-allnodes"
+    )
+
+    ls_la_home = (
+        "total 12\n"
+        "drwxr-xr-x  3 root   root   4096 Apr 20 14:10 .\n"
+        "drwxr-xr-x 20 root   root   4096 Apr  1 08:00 ..\n"
+        "drwxr-xr-x  8 devops devops 4096 Apr 20 14:10 devops"
+    )
+
     return [
-        {"role": "user",      "content": f"[{home}]$ whoami"},
-        {"role": "assistant", "content": username},
-        {"role": "user",      "content": f"[{home}]$ id"},
-        {"role": "assistant", "content": id_str},
-        {"role": "user",      "content": f"[{home}]$ hostname"},
+        {"role": "user",      "content": f"[{home}]# whoami"},
+        {"role": "assistant", "content": "root"},
+        {"role": "user",      "content": f"[{home}]# hostname"},
         {"role": "assistant", "content": hostname},
-        {"role": "user",      "content": f"[{home}]$ ls"},
+        {"role": "user",      "content": f"[{home}]# uname -a"},
+        {"role": "assistant", "content": f"Linux {hostname} 5.15.0-91-generic #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux"},
+        {"role": "user",      "content": f"[{home}]# ls"},
         {"role": "assistant", "content": ls_home},
-        {"role": "user",      "content": f"[{home}]$ uname -r"},
-        {"role": "assistant", "content": "5.15.0-91-generic"},
-        {"role": "user",      "content": f"[{home}]$ cat /etc/os-release"},
-        {
-            "role": "assistant",
-            "content": (
-                'PRETTY_NAME="Ubuntu 22.04.3 LTS"\n'
-                'NAME="Ubuntu"\nVERSION_ID="22.04"\n'
-                'VERSION="22.04.3 LTS (Jammy Jellyfish)"\n'
-                'ID=ubuntu\nID_LIKE=debian\nHOME_URL="https://www.ubuntu.com/"\n'
-                'SUPPORT_URL="https://help.ubuntu.com/"\n'
-                'BUG_REPORT_URL="https://bugs.launchpad.net/ubuntu/"'
-            ),
-        },
+        {"role": "user",      "content": f"[{home}]# ps aux"},
+        {"role": "assistant", "content": ps_output},
+        {"role": "user",      "content": f"[{home}]# cat .bash_history"},
+        {"role": "assistant", "content": bash_history},
+        {"role": "user",      "content": f"[{home}]# cat /etc/hosts"},
+        {"role": "assistant", "content": hosts_output},
+        {"role": "user",      "content": f"[{home}]# ls -la /home"},
+        {"role": "assistant", "content": ls_la_home},
     ]
 
 
@@ -145,10 +211,10 @@ class OllamaClient:
     ):
         self.ollama_url = ollama_url.rstrip("/")
         self.model = model
-        # session_id → message list
         self._histories: Dict[str, List[Dict[str, str]]] = {}
-        # session_id → {"username": ..., "hostname": ..., "system_prompt": ...}
         self._session_meta: Dict[str, Dict[str, str]] = {}
+        # session_id → {command_str: response_str} for instant replies
+        self._fast_lookup: Dict[str, Dict[str, str]] = {}
 
     # ------------------------------------------------------------------
     # Session initialisation
@@ -171,10 +237,28 @@ class OllamaClient:
             "hostname": hostname,
             "system_prompt": _build_system_prompt(username, hostname),
         }
-        self._histories[session_id] = _build_seed(username, hostname)
+        seed = _build_seed(username, hostname)
+        self._histories[session_id] = seed
+
+        # Build fast-lookup table from seed so seeded commands return instantly.
+        # Exclude multi-arg ls variants (they're path-specific); bare "ls" is
+        # handled separately in generate() with a cwd-home check.
+        _CWD_DEPENDENT = frozenset({"ls -la", "ls -l", "ls -a", "ls -al", "ls -lh"})
+        fast: Dict[str, str] = {}
+        for i in range(len(seed) - 1):
+            if seed[i]["role"] == "user" and seed[i + 1]["role"] == "assistant":
+                content = seed[i]["content"]
+                for sep in ("]# ", "]$ "):
+                    if sep in content:
+                        cmd = content.split(sep, 1)[1].strip()
+                        if cmd not in _CWD_DEPENDENT:
+                            fast[cmd] = seed[i + 1]["content"]
+                        break
+        self._fast_lookup[session_id] = fast
+
         logger.info(
-            "LLM session initialised: session=%s user=%s host=%s",
-            session_id, username, hostname,
+            "LLM session initialised: session=%s user=%s host=%s fast_cmds=%d",
+            session_id, username, hostname, len(fast),
         )
 
     def _meta(self, session_id: str) -> Dict[str, str]:
@@ -211,6 +295,7 @@ class OllamaClient:
     def clear_session(self, session_id: str) -> None:
         self._histories.pop(session_id, None)
         self._session_meta.pop(session_id, None)
+        self._fast_lookup.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Core generate
@@ -228,8 +313,24 @@ class OllamaClient:
         The user turn is formatted as a shell prompt so the LLM always
         knows the cwd without additional system-message overhead.
         """
-        system_prompt = self._meta(session_id)["system_prompt"]
-        user_turn = f"[{cwd}]$ {command}"
+        meta = self._meta(session_id)
+        fast = self._fast_lookup.get(session_id, {})
+        cmd_stripped = command.strip()
+
+        # Fast path 1: cwd-aware ls — instant for every known directory
+        if cmd_stripped == "ls":
+            norm = cwd.rstrip("/") or "/"
+            if norm in _FS_CONTENTS:
+                return _FS_CONTENTS[norm]
+            # Unknown dir (created by attacker this session) — fall through to LLM
+
+        # Fast path 2: seeded command lookup
+        elif cmd_stripped in fast:
+            return fast[cmd_stripped]
+
+        system_prompt = meta["system_prompt"]
+        char = "#" if meta.get("username") == "root" else "$"
+        user_turn = f"[{cwd}]{char} {command}"
         self._append(session_id, "user", user_turn)
 
         messages = [{"role": "system", "content": system_prompt}] + self._history(

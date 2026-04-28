@@ -14,14 +14,68 @@ The flow is:
 
 from __future__ import annotations
 
+import re
 import time
 import json
 import os
 import posixpath  # always POSIX paths for the simulated Linux filesystem
+from datetime import datetime
 from typing import Optional, Dict, Any
 from twisted.python import log
 
 from LLM.client import OllamaClient
+
+# ---------------------------------------------------------------------------
+# Destructive command simulation
+# ---------------------------------------------------------------------------
+
+_RM_RF_WARNING = (
+    "rm: it is dangerous to operate recursively on '/'\r\n"
+    "rm: use --no-preserve-root to override this safeguard\r\n"
+)
+
+_RM_SAFE    = re.compile(r'\brm\b.{0,20}-[a-z]*r[a-z]*f[a-z]*.{0,10}/')
+_FORKBOMB   = re.compile(r':\s*\(\s*\)\s*\{|:\(\)\{')
+
+
+def _crash_output() -> str:
+    ts = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    return (
+        "rm: removing root directory '/'...\r\n"
+        "\r\n"
+        f"Broadcast message from root@ubuntu-srv (pts/0) ({ts}):\r\n"
+        "The system will go down for reboot NOW!\r\n"
+        "\r\n"
+        "INIT: Switching to runlevel: 6\r\n"
+        "INIT: Sending processes configured via /etc/inittab the TERM signal\r\n"
+        "Stopping OpenBSD Secure Shell server: sshd.\r\n"
+        "Will now restart\r\n"
+    )
+
+
+def _forkbomb_output() -> str:
+    ts = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    return (
+        "-bash: fork: Cannot allocate memory\r\n" * 6
+        + "\r\n"
+        + f"Broadcast message from root@ubuntu-srv (pts/0) ({ts}):\r\n"
+        + "The system is going down for reboot NOW!\r\n"
+        + "\r\n"
+        + "INIT: Switching to runlevel: 6\r\n"
+        + "Stopping OpenBSD Secure Shell server: sshd.\r\n"
+    )
+
+
+def _classify_destructive(command: str) -> str:
+    """Return 'nuclear', 'warn', 'forkbomb', or '' for normal commands."""
+    stripped = command.replace(" ", "")
+    if _FORKBOMB.search(command) or ":(){" in stripped:
+        return "forkbomb"
+    if "--no-preserve-root" in command and _RM_SAFE.search(command):
+        return "nuclear"
+    if _RM_SAFE.search(command):
+        return "warn"
+    return ""
 from utils.terminal import sanitize_for_llm, process_backspaces
 from utils.session import SessionInfo, get_session_manager
 
@@ -341,6 +395,174 @@ class ShellCommandBridge:
         # Command cache for rate limiting and deduplication
         self.last_command_hash: Dict[str, int] = {}
         self.duplicate_threshold: int = 5  # Seconds
+        # Tracks files/dirs created during each session for instant ls responses
+        self._session_created: Dict[str, set] = {}
+
+    # ------------------------------------------------------------------
+    # Local command interceptor — instant responses, no LLM call.
+    # Appends to LLM history so follow-up commands have context.
+    # ------------------------------------------------------------------
+
+    def _intercept_one(self, session_id: str, cmd: str, cwd: str) -> Optional[str]:
+        """
+        Handle one simple command locally without the LLM.
+        Returns the response string (may be empty) or None if LLM is needed.
+        """
+        from LLM.client import _FS_CONTENTS
+
+        parts = cmd.strip().split(None, 1)
+        if not parts:
+            return ""
+        verb = parts[0].lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
+
+        if verb == "whoami":
+            return "root"
+        if verb == "id":
+            return "uid=0(root) gid=0(root) groups=0(root)"
+        if verb in ("export", "unset", "alias", "unalias", "source", "."):
+            return ""
+        if verb in ("chmod", "chown", "chgrp", "kill", "killall", "rm"):
+            return ""
+        if verb == "echo":
+            return args
+        if verb == "clear":
+            return "\033[2J\033[H"
+
+        if verb == "history":
+            cmds = [
+                "cat /etc/shadow", "mysql -u admin -p'P@ssw0rd123!'",
+                "cd /var/www/html", "git pull origin main", "git push origin main",
+                "vi /etc/nginx/nginx.conf", "systemctl restart nginx",
+                "tail -f /var/log/nginx/error.log", "cat .aws/credentials",
+                "aws s3 ls s3://prod-backups-2023", "df -h",
+                "netstat -tulnp", "cat /etc/hosts",
+            ]
+            return "\n".join(f"  {i+1}  {c}" for i, c in enumerate(cmds))
+
+        if verb == "date":
+            from datetime import datetime
+            return datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y")
+
+        if verb == "uptime":
+            from datetime import datetime
+            t = datetime.now().strftime("%H:%M:%S")
+            return f" {t} up 6 days, 14:23,  1 user,  load average: 0.08, 0.12, 0.09"
+
+        if verb == "uname":
+            if not args:
+                return "Linux"
+            if "-a" in args:
+                return "Linux ubuntu-srv 5.15.0-91-generic #101-Ubuntu SMP Tue Nov 14 13:30:08 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux"
+            out = []
+            if "-s" in args: out.append("Linux")
+            if "-n" in args: out.append("ubuntu-srv")
+            if "-r" in args: out.append("5.15.0-91-generic")
+            if "-m" in args or "-p" in args or "-i" in args: out.append("x86_64")
+            if "-o" in args: out.append("GNU/Linux")
+            return " ".join(out) if out else "Linux"
+
+        if verb == "which":
+            _which = {
+                "python3": "/usr/bin/python3", "python": "/usr/bin/python3",
+                "bash": "/bin/bash", "sh": "/bin/sh",
+                "curl": "/usr/bin/curl", "wget": "/usr/bin/wget",
+                "nc": "/usr/bin/nc", "netcat": "/usr/bin/netcat",
+                "vim": "/usr/bin/vim", "vi": "/usr/bin/vi", "nano": "/usr/bin/nano",
+                "cat": "/bin/cat", "ls": "/bin/ls", "grep": "/bin/grep",
+                "awk": "/usr/bin/awk", "find": "/usr/bin/find",
+                "ssh": "/usr/bin/ssh", "scp": "/usr/bin/scp",
+                "git": "/usr/bin/git", "mysql": "/usr/bin/mysql",
+                "nginx": "/usr/sbin/nginx", "perl": "/usr/bin/perl",
+                "ruby": "", "nmap": "", "gcc": "/usr/bin/gcc",
+            }
+            tool = args.strip()
+            if tool in _which:
+                return _which[tool] if _which[tool] else f"which: no {tool} in ($PATH)"
+            return None  # unknown tool — let LLM decide
+
+        if verb == "mkdir":
+            if not args:
+                return "mkdir: missing operand"
+            for name in args.split():
+                if name.startswith("-"):
+                    continue
+                full = posixpath.normpath(posixpath.join(cwd, name))
+                self._session_created.setdefault(session_id, set()).add(full)
+            return ""
+
+        if verb == "touch":
+            for name in args.split():
+                if name.startswith("-"):
+                    continue
+                full = posixpath.normpath(posixpath.join(cwd, name))
+                self._session_created.setdefault(session_id, set()).add(full)
+            return ""
+
+        if verb == "ls":
+            flags = ""
+            path_arg = None
+            for tok in args.split():
+                if tok.startswith("-"):
+                    flags += tok[1:]
+                else:
+                    path_arg = tok
+                    break
+
+            if path_arg is not None:
+                target = path_arg if path_arg.startswith("/") else posixpath.normpath(posixpath.join(cwd, path_arg))
+                target = target.rstrip("/") or "/"
+                display = path_arg
+            else:
+                target = cwd.rstrip("/") or "/"
+                display = "."
+
+            session_paths = self._session_created.get(session_id, set())
+
+            # Merge static FS with any session-created children
+            if target in _FS_CONTENTS:
+                static = [x for x in _FS_CONTENTS[target].split() if x]
+                created = [posixpath.basename(p) for p in session_paths if posixpath.dirname(p) == target]
+                items = static + [c for c in created if c not in static]
+                combined = "  ".join(items)
+                if "R" in flags:
+                    return f"{display}:\n{combined}".rstrip()
+                return combined
+
+            # Session-created directory
+            if target in session_paths:
+                children = [posixpath.basename(p) for p in session_paths if posixpath.dirname(p) == target]
+                if "R" in flags:
+                    return f"{display}:\n" + "\n".join(children)
+                return "  ".join(children) if children else ""
+
+            if path_arg is not None:
+                return f"ls: cannot access '{path_arg}': No such file or directory"
+            return None
+
+        return None  # needs LLM
+
+    def _intercept_compound(
+        self, session_id: str, command: str, cwd: str
+    ) -> Optional[str]:
+        """
+        Try to handle a compound (&&-separated) command locally.
+        Returns combined output or None if any part needs the LLM.
+        Also appends every handled sub-command to LLM history.
+        """
+        parts = re.split(r'\s*&&\s*', command)
+        responses: list = []
+        for part in parts:
+            r = self._intercept_one(session_id, part.strip(), cwd)
+            if r is None:
+                return None
+            responses.append(r)
+            # Tell the LLM about this command so follow-ups have context
+            self.ollama_client._append(session_id, "user", f"[{cwd}]# {part.strip()}")
+            self.ollama_client._append(session_id, "assistant", r)
+        return "\n".join(r for r in responses if r)
+
+    # ------------------------------------------------------------------
 
     def update_session_environment(
         self,
@@ -440,9 +662,31 @@ class ShellCommandBridge:
             return {"error": f"Command sanitization failed: {e}"}
         
         if not cleaned_command or cleaned_command.isspace():
-            # Empty command, don't send to LLM
             return {"empty": True}
-        
+
+        # pwd: answer from state tracker instantly, no LLM call
+        if cleaned_command.strip() in ("pwd",):
+            state = self.state_tracker.get_state(session_id)
+            cwd = state.get("cwd", "/root") if state else "/root"
+            return {"terminal_response": (cwd + "\r\n").encode(), "command": cleaned_command}
+
+        # Destructive command simulation
+        destructive = _classify_destructive(cleaned_command)
+        if destructive == "warn":
+            return {"terminal_response": _RM_RF_WARNING.encode(), "command": cleaned_command}
+        if destructive == "nuclear":
+            return {"terminal_response": _crash_output().encode(), "command": cleaned_command, "disconnect": True}
+        if destructive == "forkbomb":
+            return {"terminal_response": _forkbomb_output().encode(), "command": cleaned_command, "disconnect": True}
+
+        # Local interceptor — instant for simple & compound commands
+        _state = self.state_tracker.get_state(session_id)
+        _cwd = _state.get("cwd", "/root") if _state else "/root"
+        local_out = self._intercept_compound(session_id, cleaned_command, _cwd)
+        if local_out is not None:
+            resp = (local_out + "\r\n").encode() if local_out else b""
+            return {"terminal_response": resp, "command": cleaned_command}
+
         # Check for duplicate commands (rate limiting)
         if self._is_duplicate_command(session_id, cleaned_command):
             log.msg(f"Duplicate command detected for session {session_id}")
@@ -693,14 +937,8 @@ class ShellCommandBridge:
         return output.encode()
     
     def cleanup_session(self, session_id: str) -> None:
-        """
-        Cleanup when a session ends.
-        
-        Args:
-            session_id: Session to cleanup
-        """
-        # Clean up session state
         self.state_tracker.cleanup_state(session_id)
+        self._session_created.pop(session_id, None)
         
         # Clean up session info
         session = self.session_manager.get_session(session_id)
